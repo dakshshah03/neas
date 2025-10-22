@@ -7,8 +7,8 @@ from typing import Callable, Tuple
 class FreqEncoder(nn.Module):
     def __init__(self,
             input_dim: int,
-            max_freq_log2: float,
-            N_freqs: int,
+            max_freq_log2: float=5,
+            N_freqs: int = 5,
             log_sampling: bool=True,
             include_input: bool=True,
             periodic_fns: Tuple[Callable[[torch.Tensor], torch.Tensor], ...] = (torch.sin, torch.cos)):
@@ -25,15 +25,14 @@ class FreqEncoder(nn.Module):
         self.output_dim += self.input_dim * N_freqs * len(self.periodic_fns)
 
         if log_sampling:
-            self.freq_bands = 2. ** torch.linspace(0., max_freq_log2, N_freqs)
+            freq_bands = 2. ** torch.linspace(0., max_freq_log2, N_freqs)
         else:
-            self.freq_bands = torch.linspace(2. ** 0., 2. ** max_freq_log2, N_freqs)
+            freq_bands = torch.linspace(2. ** 0., 2. ** max_freq_log2, N_freqs)
 
-        self.freq_bands = self.freq_bands.numpy().tolist()
+        self.register_buffer('freq_bands', freq_bands)
 
     def forward(self,
-                input,
-                bound):
+                input):
         out = []
         if self.include_input:
             out.append(input)
@@ -59,7 +58,10 @@ class MLPBlock(nn.Module):
         nn (_type_): _description_
     """
     def __init__(self,
-                 input_dim, hidden_dim, output_dim, num_layers):
+                 input_dim,
+                 hidden_dim,
+                 output_dim,
+                 num_layers):
         super().__init__()
         layers = []
         
@@ -83,27 +85,27 @@ class MLPBlock(nn.Module):
 
 def sdf_freq_mlp(input_dim=3, output_dim=1):
     """SDF MLP with frequency encoding - 6 layers, 256 hidden size"""
-    encoder = FrequencyEncoder(input_dim=input_dim)
-    mlp = MLPBlock(encoder.out_dim, 256, output_dim, 6)
+    encoder = FreqEncoder(input_dim=input_dim)
+    mlp = MLPBlock(encoder.output_dim, 256, output_dim, 6)
     return nn.Sequential(encoder, mlp)
-
-
-def sdf_hash_mlp(input_dim=3, output_dim=1):
-    """SDF MLP with hash encoding - 2 layers, 64 hidden size"""
-    encoder = HashEncoder(input_dim=input_dim)
-    mlp = MLPBlock(encoder.out_dim, 64, output_dim, 2)
-    return nn.Sequential(encoder, mlp)
-
 
 def att_freq_mlp(input_dim=3, output_dim=1):
     """Attenuation MLP with frequency encoding - 3 layers, 256 hidden size"""
-    encoder = FrequencyEncoder(input_dim=input_dim)
-    mlp = MLPBlock(encoder.out_dim, 256, output_dim, 3)
+    encoder = FreqEncoder(input_dim=input_dim)
+    mlp = MLPBlock(encoder.output_dim, 256, output_dim, 3)
     return nn.Sequential(encoder, mlp)
 
 
-def att_hash_mlp(input_dim=3, output_dim=1):
-    """Attenuation MLP with hash encoding - 2 layers, 64 hidden size"""
-    encoder = HashEncoder(input_dim=input_dim)
-    mlp = MLPBlock(encoder.out_dim, 64, output_dim, 2)
-    return nn.Sequential(encoder, mlp)
+
+# def sdf_hash_mlp(input_dim=3, output_dim=1):
+#     """SDF MLP with hash encoding - 2 layers, 64 hidden size"""
+#     encoder = HashEncoder(input_dim=input_dim)
+#     mlp = MLPBlock(encoder.out_dim, 64, output_dim, 2)
+#     return nn.Sequential(encoder, mlp)
+
+
+# def att_hash_mlp(input_dim=3, output_dim=1):
+#     """Attenuation MLP with hash encoding - 2 layers, 64 hidden size"""
+#     encoder = HashEncoder(input_dim=input_dim)
+#     mlp = MLPBlock(encoder.out_dim, 64, output_dim, 2)
+#     return nn.Sequential(encoder, mlp)
