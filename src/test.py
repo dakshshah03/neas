@@ -65,7 +65,7 @@ for batch_idx, data in enumerate(train_loader):
     print(f"SDF distances shape: {sdf_distances.shape}")  # [1024] aka [b]
     print(f"SDF distances range: [{sdf_distances.min().item():.4f}, {sdf_distances.max().item():.4f}]")
     print(f"Boundary values shape: {boundary_values.shape}")
-    print(f"Attention values shape: {attenuation_values.shape}")
+    print(f"Attenuation values shape: {attenuation_values.shape}")
     print(f"Attenuation coefficient shape: {att_coeff.shape}")
     
     break
