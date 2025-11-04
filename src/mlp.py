@@ -83,11 +83,27 @@ class MLPBlock(nn.Module):
         return self.network(x)
 
 
-def sdf_freq_mlp(input_dim=3, output_dim=1):
-    """SDF MLP with frequency encoding - 6 layers, 256 hidden size"""
+class SDFMLPWrapper(nn.Module):
+    """Wrapper for SDF MLP that returns distances and features separately"""
+    def __init__(self, encoder, mlp, feature_dim):
+        super().__init__()
+        self.encoder = encoder
+        self.mlp = mlp
+        self.feature_dim = feature_dim
+    
+    def forward(self, x):
+        encoded = self.encoder(x)
+        output = self.mlp(encoded)
+        distances = output[:, 0] 
+        features = output[:, 1:1+self.feature_dim]
+        return distances, features
+
+
+def sdf_freq_mlp(input_dim=3, output_dim=1, feature_dim=8):
+    """SDF MLP with frequency encoding - returns (distances [B], features [B, K])"""
     encoder = FreqEncoder(input_dim=input_dim)
-    mlp = MLPBlock(encoder.output_dim, 256, output_dim, 6)
-    return nn.Sequential(encoder, mlp)
+    mlp = MLPBlock(encoder.output_dim, 256, output_dim + feature_dim, 6)
+    return SDFMLPWrapper(encoder, mlp, feature_dim)
 
 def att_freq_mlp(input_dim=3, output_dim=1):
     """Attenuation MLP with frequency encoding - 3 layers, 256 hidden size"""
