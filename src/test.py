@@ -2,6 +2,7 @@ from mlp import FreqEncoder, att_freq_mlp, sdf_freq_mlp
 from dataset import TIGREDataset
 from torch.utils.data import DataLoader
 import torch
+import os
 
 def surface_boundary_function(d, s):
     return torch.exp(-s*d)/(1 + torch.exp(-s*d))
@@ -10,6 +11,8 @@ def volume_render_intensity(att_coeff, dists):
     mu_delta_sum = torch.sum(att_coeff * dists, dim=-1) # [batch_size, n_rays]
     I_hat = torch.exp(-mu_delta_sum) # [batch_size, n_rays]
     return I_hat
+
+os.makedirs("./checkpoints/", exist_ok=True)
 
 # Training configuration
 num_epochs = 60
@@ -81,6 +84,7 @@ for epoch in range(num_epochs):
         sdf_eikonal, _ = sdf_model(pts_eikonal)
         sdf_sum = sdf_eikonal.sum()
         
+        # calculates the gradient of the SDF field 
         n = torch.autograd.grad(
             outputs=sdf_sum,
             inputs=pts_eikonal,
