@@ -5,22 +5,23 @@ import torch
 import os
 import argparse
 import matplotlib.pyplot as plt
+from datetime import datetime
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train NeAS model")
     
-    parser.add_argument("--epochs", type=int, default=60, help="Number of epochs")
+    parser.add_argument("--epochs", type=int, default=200, help="Number of epochs")
     parser.add_argument("--n_samples", type=int, default=64, help="Number of samples per ray")
-    parser.add_argument("--lambda_reg", type=float, default=0.01, help="Regularization strength")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--lambda_reg", type=float, default=0.05, help="Regularization strength")
+    parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
     
     parser.add_argument("--data_path", type=str, default="data/foot_50.pickle", help="Path to data file")
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints/", help="Directory to save checkpoints")
-    parser.add_argument("--save_interval", type=int, default=20, help="Epoch interval for saving checkpoints")
+    parser.add_argument("--save_interval", type=int, default=50, help="Epoch interval for saving checkpoints")
     
     parser.add_argument("--feature_dim", type=int, default=8, help="Feature dimension for SDF model")
-    parser.add_argument("--s_param", type=float, default=20.0, help="Initial value for s parameter")
+    parser.add_argument("--s_param", type=float, default=30.0, help="Initial value for s parameter")
     
     return parser.parse_args()
 
@@ -69,7 +70,12 @@ def render_image(rays, sdf_model, att_model, s, n_samples, chunk_size=4096):
     return pred_intensity.reshape(H, W)
 
 def train(args):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dataset_name = os.path.splitext(os.path.basename(args.data_path))[0]
+    args.checkpoint_dir = os.path.join(args.checkpoint_dir, f"{dataset_name}_{timestamp}")
+    
     os.makedirs(args.checkpoint_dir, exist_ok=True)
+    print(f"Checkpoints will be saved to: {args.checkpoint_dir}")
 
     train_data = TIGREDataset(path=args.data_path, type="train")
     train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=0)
