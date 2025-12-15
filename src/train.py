@@ -4,6 +4,7 @@ from torch.utils.data import DataLoader
 import torch
 import os
 import argparse
+import matplotlib.pyplot as plt
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train NeAS model")
@@ -16,9 +17,10 @@ def parse_args():
     
     parser.add_argument("--data_path", type=str, default="data/foot_50.pickle", help="Path to data file")
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints/", help="Directory to save checkpoints")
-    parser.add_argument("--save_interval", type=int, default=10, help="Epoch interval for saving checkpoints")
+    parser.add_argument("--save_interval", type=int, default=20, help="Epoch interval for saving checkpoints")
     
     parser.add_argument("--feature_dim", type=int, default=8, help="Feature dimension for SDF model")
+    parser.add_argument("--s_param", type=float, default=20.0, help="Initial value for s parameter")
     
     return parser.parse_args()
 
@@ -30,11 +32,50 @@ def volume_render_intensity(att_coeff, dists):
     I_hat = torch.exp(-mu_delta_sum) # [batch_size, n_rays]
     return I_hat
 
+def render_image(rays, sdf_model, att_model, s, n_samples, chunk_size=4096):
+    device = rays.device
+    H, W, _ = rays.shape
+    rays_flat = rays.reshape(-1, 8)
+    
+    pred_intensities = []
+    
+    with torch.no_grad():
+        for i in range(0, rays_flat.shape[0], chunk_size):
+            chunk_rays = rays_flat[i:i+chunk_size]
+            
+            ray_origins = chunk_rays[..., :3]
+            ray_directions = chunk_rays[..., 3:6] 
+            near = chunk_rays[..., 6:7]
+            far = chunk_rays[..., 7:8]
+            
+            # ray point sampling
+            t_vals = torch.linspace(0., 1., steps=n_samples, device=device)
+            sample_depths = near * (1. - t_vals) + far * t_vals
+            sampled_points = ray_origins.unsqueeze(1) + ray_directions.unsqueeze(1) * sample_depths.unsqueeze(-1)
+            sampled_points_flat = sampled_points.reshape(-1, 3)
+            
+            sdf_distances, feature_vector = sdf_model(sampled_points_flat)
+            boundary_values = surface_boundary_function(sdf_distances, s)
+            attenuation_values = torch.nn.functional.softplus(att_model(feature_vector))
+            
+            att_coeff = attenuation_values.squeeze(-1) * boundary_values
+            att_coeff = att_coeff.reshape(chunk_rays.shape[0], n_samples)
+            
+            dists = (far - near) / n_samples
+            chunk_intensity = volume_render_intensity(att_coeff, dists)
+            pred_intensities.append(chunk_intensity)
+            
+    pred_intensity = torch.cat(pred_intensities, dim=0)
+    return pred_intensity.reshape(H, W)
+
 def train(args):
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
-    data = TIGREDataset(path=args.data_path)
-    train_loader = DataLoader(data, batch_size=args.batch_size, shuffle=True, num_workers=0)
+    train_data = TIGREDataset(path=args.data_path, type="train")
+    train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=0)
+
+    val_data = TIGREDataset(path=args.data_path, type="val")
+    val_loader = DataLoader(val_data, batch_size=1, shuffle=False, num_workers=0)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -42,14 +83,14 @@ def train(args):
     sdf_model = sdf_freq_mlp(input_dim=3, output_dim=1, feature_dim=args.feature_dim).to(device)
     att_model = att_freq_mlp(input_dim=args.feature_dim, output_dim=1).to(device)
 
-    # I do not know why the llm decided to make s a learnable parameter but lets see how that goes
-    s = torch.tensor(20.0, requires_grad=True, device=device)
+    s = torch.tensor(args.s_param, requires_grad=True, device=device)
 
     optimizer = torch.optim.Adam(
         list(sdf_model.parameters()) + list(att_model.parameters()), 
         lr=args.lr
     )
 
+    loss_history = {'total': [], 'int': [], 'reg': []}
     print("Starting training...")
     for epoch in range(args.epochs):
         epoch_loss = 0.0
@@ -62,7 +103,6 @@ def train(args):
             
             optimizer.zero_grad()
             
-            # Extract ray components
             ray_origins = rays[..., :3]
             ray_directions = rays[..., 3:6] 
             near = rays[..., 6:7]
@@ -102,7 +142,7 @@ def train(args):
                 create_graph=True,
             )[0]
             
-            # loss (int and reg)
+            # loss (intensity and regularization)
             L_int = torch.nn.functional.mse_loss(pred_intensity, gt_intensity)
             n_norm = torch.linalg.norm(n, dim=-1)
             L_reg = torch.mean((n_norm - 1.0)**2)
@@ -122,17 +162,32 @@ def train(args):
                       f"Int Loss: {L_int.item():.6f}, "
                       f"Reg Loss: {L_reg.item():.6f}")
         
-        # Print epoch summary
         avg_loss = epoch_loss / len(train_loader)
         avg_int_loss = epoch_int_loss / len(train_loader)
         avg_reg_loss = epoch_reg_loss / len(train_loader)
+        
+        loss_history['total'].append(avg_loss)
+        loss_history['int'].append(avg_int_loss)
+        loss_history['reg'].append(avg_reg_loss)
+
+        plt.figure(figsize=(10, 5))
+        plt.plot(loss_history['total'], label='Total Loss')
+        plt.plot(loss_history['int'], label='Intensity Loss')
+        plt.plot(loss_history['reg'], label='Regularization Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('Training Loss')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(os.path.join(args.checkpoint_dir, 'loss_curve.png'))
+        plt.close()
         
         print(f"Epoch {epoch+1}/{args.epochs} Summary - "
               f"Avg Loss: {avg_loss:.6f}, "
               f"Avg Int Loss: {avg_int_loss:.6f}, "
               f"Avg Reg Loss: {avg_reg_loss:.6f}")
         
-        # Save checkpoint
+        # checkpointing + validation
         if (epoch + 1) % args.save_interval == 0:
             save_path = os.path.join(args.checkpoint_dir, f'checkpoint_epoch_{epoch+1}.pth')
             torch.save({
@@ -144,6 +199,37 @@ def train(args):
                 'loss': avg_loss,
             }, save_path)
             print(f"Checkpoint saved at epoch {epoch+1}")
+
+            print("Running validation...")
+            sdf_model.eval()
+            att_model.eval()
+            
+            val_save_dir = os.path.join(args.checkpoint_dir, f'val_epoch_{epoch+1}')
+            os.makedirs(val_save_dir, exist_ok=True)
+            
+            for i, batch in enumerate(val_loader):
+                rays = batch['rays'].squeeze(0).to(device) # [W, H, 8]
+                projs = batch['projs'].squeeze(0).to(device) # [W, H]
+                
+                img = render_image(rays, sdf_model, att_model, s, args.n_samples)
+                
+                # Save comparison
+                plt.figure(figsize=(10, 5))
+                plt.subplot(1, 2, 1)
+                plt.imshow(img.cpu().numpy().T, cmap='gray')
+                plt.title('Predicted')
+                plt.axis('off')
+                
+                plt.subplot(1, 2, 2)
+                plt.imshow(torch.exp(-projs).cpu().numpy().T, cmap='gray')
+                plt.title('Ground Truth')
+                plt.axis('off')
+                
+                plt.savefig(os.path.join(val_save_dir, f'val_{i}.png'))
+                plt.close()
+            
+            sdf_model.train()
+            att_model.train()
 
     print("Training completed!")
 
