@@ -18,10 +18,11 @@ def parse_args():
     
     parser.add_argument("--data_path", type=str, default="data/foot_50.pickle", help="Path to data file")
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints/", help="Directory to save checkpoints")
-    parser.add_argument("--save_interval", type=int, default=50, help="Epoch interval for saving checkpoints")
+    parser.add_argument("--save_interval", type=int, default=25, help="Epoch interval for saving checkpoints")
     
     parser.add_argument("--feature_dim", type=int, default=8, help="Feature dimension for SDF model")
     parser.add_argument("--s_param", type=float, default=30.0, help="Initial value for s parameter")
+    parser.add_argument("--val_chunk_size", type=int, default=65536, help="Chunk size for validation rendering")
     
     return parser.parse_args()
 
@@ -217,7 +218,7 @@ def train(args):
                 rays = batch['rays'].squeeze(0).to(device) # [W, H, 8]
                 projs = batch['projs'].squeeze(0).to(device) # [W, H]
                 
-                img = render_image(rays, sdf_model, att_model, s, args.n_samples)
+                img = render_image(rays, sdf_model, att_model, s, args.n_samples, chunk_size=args.val_chunk_size)
                 
                 # Save comparison
                 plt.figure(figsize=(10, 5))
