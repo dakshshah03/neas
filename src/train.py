@@ -11,18 +11,18 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train NeAS model")
     
     parser.add_argument("--epochs", type=int, default=200, help="Number of epochs")
-    parser.add_argument("--n_samples", type=int, default=64, help="Number of samples per ray")
-    parser.add_argument("--lambda_reg", type=float, default=0.05, help="Regularization strength")
+    parser.add_argument("--n_samples", type=int, default=128, help="Number of samples per ray")
+    parser.add_argument("--lambda_reg", type=float, default=0.02, help="Regularization strength")
     parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
-    parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
+    parser.add_argument("--batch_size", type=int, default=512, help="Batch size")
     
     parser.add_argument("--data_path", type=str, default="data/foot_50.pickle", help="Path to data file")
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints/", help="Directory to save checkpoints")
-    parser.add_argument("--save_interval", type=int, default=25, help="Epoch interval for saving checkpoints")
+    parser.add_argument("--save_interval", type=int, default=100, help="Epoch interval for saving checkpoints")
     
     parser.add_argument("--feature_dim", type=int, default=8, help="Feature dimension for SDF model")
-    parser.add_argument("--s_param", type=float, default=30.0, help="Initial value for s parameter")
-    parser.add_argument("--val_chunk_size", type=int, default=65536, help="Chunk size for validation rendering")
+    parser.add_argument("--s_param", type=float, default=50.0, help="Initial value for s (boundary sharpness) parameter")
+    parser.add_argument("--val_chunk_size", type=int, default=4096, help="Chunk size for validation rendering")
     
     return parser.parse_args()
 
@@ -77,9 +77,8 @@ def train(args):
     
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     print(f"Checkpoints will be saved to: {args.checkpoint_dir}")
-
-    train_data = TIGREDataset(path=args.data_path, type="train")
-    train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=0)
+    train_data = TIGREDataset(path=args.data_path, n_rays=args.batch_size, type="train")
+    train_loader = DataLoader(train_data, batch_size=1, shuffle=True, num_workers=0)
 
     val_data = TIGREDataset(path=args.data_path, type="val")
     val_loader = DataLoader(val_data, batch_size=1, shuffle=False, num_workers=0)

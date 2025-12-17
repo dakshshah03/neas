@@ -106,9 +106,9 @@ def sdf_freq_mlp(input_dim=3, output_dim=1, feature_dim=8):
     return SDFMLPWrapper(encoder, mlp, feature_dim)
 
 def att_freq_mlp(input_dim=3, output_dim=1):
-    """Attenuation MLP with frequency encoding - 3 layers, 256 hidden size"""
+    """Attenuation MLP with frequency encoding, 256 hidden size"""
     encoder = FreqEncoder(input_dim=input_dim)
-    mlp = MLPBlock(encoder.output_dim, 256, output_dim, 3)
+    mlp = MLPBlock(encoder.output_dim, 256, output_dim, 4)
     return nn.Sequential(encoder, mlp)
 
 
