@@ -66,12 +66,31 @@ class TIGREDataset(Dataset):
         self.geo = ConeGeometry(data)
         self.type = type
         self.n_rays = n_rays
+        
+        # normalize image (between 0 and 1) based on neas paper spec
+        max_extent = np.max(self.geo.sVoxel)
+        self.scene_scale = 1.0 / max_extent
+        self.geo.DSO *= self.scene_scale
+        self.geo.DSD *= self.scene_scale
+        self.geo.dDetector *= self.scene_scale
+        self.geo.sDetector *= self.scene_scale
+        self.geo.dVoxel *= self.scene_scale
+        self.geo.sVoxel *= self.scene_scale
+        self.geo.offOrigin *= self.scene_scale
+        self.geo.offDetector *= self.scene_scale
+        
         self.near, self.far = self.get_near_far(self.geo)
 
         if type == "train":
-            self.projs = torch.tensor(
-                data["train"]["projections"], dtype=torch.float32, device=device
-            )
+            # Normalize projections: pixel values in [0,1], background=1 (no attenuation)
+            projs_raw = torch.tensor(data["train"]["projections"], dtype=torch.float32, device=device)
+            self.projs = torch.exp(-projs_raw)
+            proj_min = self.projs.min()
+            proj_max = self.projs.max()
+            if proj_max > proj_min:
+                self.projs = (self.projs - proj_min) / (proj_max - proj_min)
+            self.projs = -torch.log(self.projs.clamp(min=1e-10))
+            
             angles = data["train"]["angles"]
             rays = self.get_rays(angles, self.geo, device)
             self.rays = torch.cat(
@@ -107,9 +126,15 @@ class TIGREDataset(Dataset):
                 self.get_voxels(self.geo), dtype=torch.float32, device=device
             )
         elif type == "val":
-            self.projs = torch.tensor(
-                data["val"]["projections"], dtype=torch.float32, device=device
-            )
+            # val normalization
+            projs_raw = torch.tensor(data["val"]["projections"], dtype=torch.float32, device=device)
+            self.projs = torch.exp(-projs_raw)
+            proj_min = self.projs.min()
+            proj_max = self.projs.max()
+            if proj_max > proj_min:
+                self.projs = (self.projs - proj_min) / (proj_max - proj_min)
+            self.projs = -torch.log(self.projs.clamp(min=1e-10))
+            
             angles = data["val"]["angles"]
             rays = self.get_rays(angles, self.geo, device)
             self.rays = torch.cat(

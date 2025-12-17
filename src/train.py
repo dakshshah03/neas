@@ -11,18 +11,19 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train NeAS model")
     
     parser.add_argument("--epochs", type=int, default=200, help="Number of epochs")
-    parser.add_argument("--n_samples", type=int, default=128, help="Number of samples per ray")
-    parser.add_argument("--lambda_reg", type=float, default=0.02, help="Regularization strength")
+    parser.add_argument("--n_samples", type=int, default=128, help="Number of samples per ray during training")
+    parser.add_argument("--lambda_reg", type=float, default=0.01, help="Regularization strength")
     parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
-    parser.add_argument("--batch_size", type=int, default=512, help="Batch size")
+    parser.add_argument("--batch_size", type=int, default=512, help="Number of rays per image")
     
     parser.add_argument("--data_path", type=str, default="data/foot_50.pickle", help="Path to data file")
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints/", help="Directory to save checkpoints")
     parser.add_argument("--save_interval", type=int, default=100, help="Epoch interval for saving checkpoints")
     
     parser.add_argument("--feature_dim", type=int, default=8, help="Feature dimension for SDF model")
-    parser.add_argument("--s_param", type=float, default=50.0, help="Initial value for s (boundary sharpness) parameter")
+    parser.add_argument("--s_param", type=float, default=20.0, help="Initial value for s (boundary sharpness) parameter")
     parser.add_argument("--val_chunk_size", type=int, default=4096, help="Chunk size for validation rendering")
+    parser.add_argument("--val_n_samples", type=int, default=256, help="Number of samples per ray during validation (higher for better quality)")
     
     return parser.parse_args()
 
@@ -217,7 +218,7 @@ def train(args):
                 rays = batch['rays'].squeeze(0).to(device) # [W, H, 8]
                 projs = batch['projs'].squeeze(0).to(device) # [W, H]
                 
-                img = render_image(rays, sdf_model, att_model, s, args.n_samples, chunk_size=args.val_chunk_size)
+                img = render_image(rays, sdf_model, att_model, s, args.val_n_samples, chunk_size=args.val_chunk_size)
                 
                 # Save comparison
                 plt.figure(figsize=(10, 5))
