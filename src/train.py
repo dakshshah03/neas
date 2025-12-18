@@ -6,6 +6,7 @@ import os
 import argparse
 import matplotlib.pyplot as plt
 from datetime import datetime
+from tqdm import tqdm
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train NeAS model")
@@ -13,8 +14,10 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=200, help="Number of epochs")
     parser.add_argument("--n_samples", type=int, default=128, help="Number of samples per ray during training")
     parser.add_argument("--lambda_reg", type=float, default=0.01, help="Regularization strength")
-    parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--batch_size", type=int, default=512, help="Number of rays per image")
+    parser.add_argument("--lr_step_size", type=int, default=50, help="StepLR step size (epochs)")
+    parser.add_argument("--lr_gamma", type=float, default=0.5, help="StepLR gamma")
     
     parser.add_argument("--data_path", type=str, default="data/foot_50.pickle", help="Path to data file")
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints/", help="Directory to save checkpoints")
@@ -23,7 +26,7 @@ def parse_args():
     parser.add_argument("--feature_dim", type=int, default=8, help="Feature dimension for SDF model")
     parser.add_argument("--s_param", type=float, default=20.0, help="Initial value for s (boundary sharpness) parameter")
     parser.add_argument("--val_chunk_size", type=int, default=4096, help="Chunk size for validation rendering")
-    parser.add_argument("--val_n_samples", type=int, default=256, help="Number of samples per ray during validation (higher for better quality)")
+    parser.add_argument("--val_n_samples", type=int, default=128, help="Number of samples per ray during validation (higher for better quality)")
     
     return parser.parse_args()
 
@@ -97,14 +100,17 @@ def train(args):
         lr=args.lr
     )
 
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_step_size, gamma=args.lr_gamma)
+
     loss_history = {'total': [], 'int': [], 'reg': []}
     print("Starting training...")
-    for epoch in range(args.epochs):
+    epoch_tqdm = tqdm(range(args.epochs), desc="Training")
+    for epoch in epoch_tqdm:
         epoch_loss = 0.0
         epoch_int_loss = 0.0
         epoch_reg_loss = 0.0
         
-        for batch_idx, batch_data in enumerate(train_loader):
+        for batch_idx, batch_data in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}", leave=False)):
             rays = batch_data['rays'].to(device)
             projs = batch_data['projs'].to(device)
             
@@ -162,12 +168,6 @@ def train(args):
             epoch_int_loss += L_int.item()
             epoch_reg_loss += L_reg.item()
             epoch_loss += L_total.item()
-            
-            if batch_idx % 10 == 0:
-                print(f"Epoch {epoch+1}/{args.epochs}, Batch {batch_idx}: "
-                      f"Total Loss: {L_total.item():.6f}, "
-                      f"Int Loss: {L_int.item():.6f}, "
-                      f"Reg Loss: {L_reg.item():.6f}")
         
         avg_loss = epoch_loss / len(train_loader)
         avg_int_loss = epoch_int_loss / len(train_loader)
@@ -175,12 +175,18 @@ def train(args):
         
         loss_history['total'].append(avg_loss)
         loss_history['int'].append(avg_int_loss)
-        loss_history['reg'].append(avg_reg_loss)
+        loss_history['reg'].append(args.lambda_reg * avg_reg_loss)
+
+        epoch_tqdm.set_postfix({
+            'loss': f"{avg_loss:.4f}",
+            'int_loss': f"{avg_int_loss:.4f}",
+            'reg_loss': f"{avg_reg_loss:.4f}"
+        })
 
         plt.figure(figsize=(10, 5))
         plt.plot(loss_history['total'], label='Total Loss')
         plt.plot(loss_history['int'], label='Intensity Loss')
-        plt.plot(loss_history['reg'], label='Regularization Loss')
+        plt.plot(loss_history['reg'], label='Regularization Loss (Lambda scaled)')
         plt.xlabel('Epoch')
         plt.ylabel('Loss')
         plt.title('Training Loss')
@@ -189,12 +195,6 @@ def train(args):
         plt.savefig(os.path.join(args.checkpoint_dir, 'loss_curve.png'))
         plt.close()
         
-        print(f"Epoch {epoch+1}/{args.epochs} Summary - "
-              f"Avg Loss: {avg_loss:.6f}, "
-              f"Avg Int Loss: {avg_int_loss:.6f}, "
-              f"Avg Reg Loss: {avg_reg_loss:.6f}")
-        
-        # checkpointing + validation
         if (epoch + 1) % args.save_interval == 0:
             save_path = os.path.join(args.checkpoint_dir, f'checkpoint_epoch_{epoch+1}.pth')
             torch.save({
@@ -203,6 +203,7 @@ def train(args):
                 'att_model_state_dict': att_model.state_dict(),
                 's': s,
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
                 'loss': avg_loss,
             }, save_path)
             print(f"Checkpoint saved at epoch {epoch+1}")
@@ -237,6 +238,8 @@ def train(args):
             
             sdf_model.train()
             att_model.train()
+
+        scheduler.step()
 
     print("Training completed!")
 

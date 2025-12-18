@@ -67,9 +67,13 @@ class TIGREDataset(Dataset):
         self.type = type
         self.n_rays = n_rays
         
-        # normalize image (between 0 and 1) based on neas paper spec
+        # normalize scene to fit within unit sphere based on neas paper spec
+        # The scene should fit within a sphere of radius 1.0
+        # Calculate the maximum distance from origin to any corner of the volume
         max_extent = np.max(self.geo.sVoxel)
-        self.scene_scale = 1.0 / max_extent
+        half_diagonal = np.sqrt(np.sum((self.geo.sVoxel / 2) ** 2))
+        # Scale so that the diagonal fits within a unit sphere (radius = 1.0)
+        self.scene_scale = 1.0 / half_diagonal
         self.geo.DSO *= self.scene_scale
         self.geo.DSD *= self.scene_scale
         self.geo.dDetector *= self.scene_scale
@@ -82,14 +86,22 @@ class TIGREDataset(Dataset):
         self.near, self.far = self.get_near_far(self.geo)
 
         if type == "train":
-            # Normalize projections: pixel values in [0,1], background=1 (no attenuation)
+            # Normalize projections: intensity in [0,1], background=1 (no attenuation)
+            # Raw projections are attenuation values: I = exp(-attenuation)
             projs_raw = torch.tensor(data["train"]["projections"], dtype=torch.float32, device=device)
-            self.projs = torch.exp(-projs_raw)
-            proj_min = self.projs.min()
-            proj_max = self.projs.max()
-            if proj_max > proj_min:
-                self.projs = (self.projs - proj_min) / (proj_max - proj_min)
-            self.projs = -torch.log(self.projs.clamp(min=1e-10))
+            intensities = torch.exp(-projs_raw)
+            
+            # Background (max intensity) should be 1, foreground (min intensity) should be 0
+            intensity_max = intensities.max()  # Background (no attenuation)
+            intensity_min = intensities.min()  # Darkest point (most attenuation)
+            
+            # Normalize: background -> 1, darkest -> 0
+            if intensity_max > intensity_min:
+                intensities = (intensities - intensity_min) / (intensity_max - intensity_min)
+            
+            # Convert back to attenuation space: attenuation = -log(intensity)
+            # Background (intensity=1) -> attenuation=0, Dark areas (intensity→0) -> attenuation→∞
+            self.projs = -torch.log(intensities.clamp(min=1e-10))
             
             angles = data["train"]["angles"]
             rays = self.get_rays(angles, self.geo, device)
@@ -126,14 +138,20 @@ class TIGREDataset(Dataset):
                 self.get_voxels(self.geo), dtype=torch.float32, device=device
             )
         elif type == "val":
-            # val normalization
+            # Normalize validation projections: intensity in [0,1], background=1 (no attenuation)
             projs_raw = torch.tensor(data["val"]["projections"], dtype=torch.float32, device=device)
-            self.projs = torch.exp(-projs_raw)
-            proj_min = self.projs.min()
-            proj_max = self.projs.max()
-            if proj_max > proj_min:
-                self.projs = (self.projs - proj_min) / (proj_max - proj_min)
-            self.projs = -torch.log(self.projs.clamp(min=1e-10))
+            intensities = torch.exp(-projs_raw)
+            
+            # Background (max intensity) should be 1, foreground (min intensity) should be 0
+            intensity_max = intensities.max()  # Background (no attenuation)
+            intensity_min = intensities.min()  # Darkest point (most attenuation)
+            
+            # Normalize: background -> 1, darkest -> 0
+            if intensity_max > intensity_min:
+                intensities = (intensities - intensity_min) / (intensity_max - intensity_min)
+            
+            # Convert back to attenuation space
+            self.projs = -torch.log(intensities.clamp(min=1e-10))
             
             angles = data["val"]["angles"]
             rays = self.get_rays(angles, self.geo, device)
