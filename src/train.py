@@ -11,7 +11,7 @@ from tqdm import tqdm
 def parse_args():
     parser = argparse.ArgumentParser(description="Train NeAS model")
     
-    parser.add_argument("--epochs", type=int, default=200, help="Number of epochs")
+    parser.add_argument("--epochs", type=int, default=300, help="Number of epochs")
     parser.add_argument("--n_samples", type=int, default=128, help="Number of samples per ray during training")
     parser.add_argument("--lambda_reg", type=float, default=0.01, help="Regularization strength")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
@@ -215,27 +215,22 @@ def train(args):
             val_save_dir = os.path.join(args.checkpoint_dir, f'val_epoch_{epoch+1}')
             os.makedirs(val_save_dir, exist_ok=True)
             
-            for i, batch in enumerate(val_loader):
+            for i, batch in enumerate(tqdm(val_loader, desc="Validation", leave=False)):
                 rays = batch['rays'].squeeze(0).to(device) # [W, H, 8]
                 projs = batch['projs'].squeeze(0).to(device) # [W, H]
-                
                 img = render_image(rays, sdf_model, att_model, s, args.val_n_samples, chunk_size=args.val_chunk_size)
-                
-                # Save comparison
+
                 plt.figure(figsize=(10, 5))
                 plt.subplot(1, 2, 1)
                 plt.imshow(img.cpu().numpy().T, cmap='gray')
                 plt.title('Predicted')
                 plt.axis('off')
-                
                 plt.subplot(1, 2, 2)
                 plt.imshow(torch.exp(-projs).cpu().numpy().T, cmap='gray')
                 plt.title('Ground Truth')
                 plt.axis('off')
-                
                 plt.savefig(os.path.join(val_save_dir, f'val_{i}.png'))
                 plt.close()
-            
             sdf_model.train()
             att_model.train()
 
