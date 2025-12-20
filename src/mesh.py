@@ -1,6 +1,10 @@
 import numpy as np
 import torch
 import os
+import argparse
+from skimage.measure import marching_cubes
+
+from mlp import sdf_freq_mlp
 
 def _save_ply(path, verts, faces):
     """Save a mesh to an ASCII PLY file (triangles).
@@ -52,11 +56,6 @@ def extract_mesh_from_sdf(sdf_model,
     Returns:
         verts (np.ndarray [V,3]), faces (np.ndarray [F,3]), normals (np.ndarray [V,3]), values (np.ndarray [V])
     """
-    try:
-        from skimage.measure import marching_cubes
-    except Exception as e:
-        raise RuntimeError('skimage is required for marching cubes (pip install scikit-image)') from e
-
     # prepare device
     if device is None:
         try:
@@ -113,7 +112,6 @@ def extract_mesh_from_sdf(sdf_model,
 
 
 def _choose_checkpoint(path_or_dir):
-    import os
     if os.path.isdir(path_or_dir):
         # pick newest .pth in dir
         pths = [os.path.join(path_or_dir, f) for f in os.listdir(path_or_dir) if f.endswith('.pth')]
@@ -128,8 +126,6 @@ def _choose_checkpoint(path_or_dir):
 
 
 def _load_sdf_model_from_checkpoint(checkpoint_path, feature_dim=8, device=None):
-    import torch
-    from mlp import sdf_freq_mlp
     if device is None:
         device = torch.device('cpu')
     ckpt = torch.load(checkpoint_path, map_location=device)
@@ -153,7 +149,6 @@ def _load_sdf_model_from_checkpoint(checkpoint_path, feature_dim=8, device=None)
 
 
 def parse_cmdline():
-    import argparse
     parser = argparse.ArgumentParser(description='Extract mesh from trained SDF model (.pth)')
     parser.add_argument('checkpoint', help='Path to .pth file or directory containing .pth files')
     parser.add_argument('--feature_dim', type=int, default=8, help='Feature dimension used for the SDF model')
