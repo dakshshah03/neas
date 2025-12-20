@@ -5,6 +5,7 @@ from PIL import Image
 from torchmetrics.image import StructuralSimilarityIndexMeasure, PeakSignalNoiseRatio
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 import pandas as pd
+import argparse
 
 from dataset import TIGREDataset
 from torch.utils.data import DataLoader
@@ -13,6 +14,8 @@ import re
 
 from train import render_image
 from mlp import att_freq_mlp, sdf_freq_mlp
+
+from mesh import extract_mesh_from_sdf, _load_sdf_model_from_checkpoint
 
 # 1 load validation dataset
 # 2 run inference on validation dataset
@@ -163,7 +166,6 @@ def save_metrics(save_dir, lpips_scores, ssim_scores, psnr_scores):
     df.to_csv(os.path.join(save_dir, 'validation_metrics.csv'), index=False)
 
 if __name__ == "__main__":
-    import argparse
     parser = argparse.ArgumentParser(description="Run NeAS model validation and save predictions.")
     parser.add_argument('--model_path', type=str, required=True, help='Path to model checkpoint (.pth)')
     parser.add_argument('--val_pickle', type=str, required=True, help='Path to validation pickle file')
@@ -178,9 +180,9 @@ if __name__ == "__main__":
         match = re.search(r'epoch_(\d+)', checkpoint_base)
         if match:
             epoch_str = match.group(1)
-            val_folder = f'validation_epoch_{epoch_str}'
+            val_folder = f'validation_and_mesh_epoch_{epoch_str}'
         else:
-            val_folder = 'validation_results'
+            val_folder = 'validation_and_mesh_results'
         args.save_dir = os.path.join(model_dir, val_folder)
 
     if args.device is not None:
@@ -202,5 +204,28 @@ if __name__ == "__main__":
     print(f"Average PSNR: {avg_psnr:.4f}")
     
     save_metrics(args.save_dir, lpips_scores, ssim_scores, psnr_scores)
+
+    checkpoint_path = args.model_path
     
-    
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    feature_dim = checkpoint.get('feature_dim', 8)
+    sdf_model, _ = _load_sdf_model_from_checkpoint(checkpoint_path, feature_dim=feature_dim, device=device)
+
+    bounds = ((-1, -1, -1), (1, 1, 1))
+    resolution = 256
+    level = 0.0
+    batch_size = 65536
+
+    mesh_path = os.path.join(args.save_dir, "mesh.ply")
+    print(f"Extracting mesh to: {mesh_path}")
+    extract_mesh_from_sdf(
+        sdf_model,
+        bounds=bounds,
+        resolution=resolution,
+        level=level,
+        device=device,
+        batch_size=batch_size,
+        save_path=mesh_path
+    )
+    print(f"Mesh saved to: {mesh_path}")
+

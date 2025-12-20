@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import os
 
 def _save_ply(path, verts, faces):
     """Save a mesh to an ASCII PLY file (triangles).
@@ -167,8 +168,6 @@ def parse_cmdline():
 
 
 def main():
-    import os
-    import torch
     args = parse_cmdline()
 
     checkpoint_path = _choose_checkpoint(args.checkpoint)

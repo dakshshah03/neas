@@ -199,43 +199,44 @@ def train(args):
             save_path = os.path.join(args.checkpoint_dir, f'checkpoint_epoch_{epoch+1}.pth')
             torch.save({
                 'epoch': epoch,
+                'args': vars(args),
                 'sdf_model_state_dict': sdf_model.state_dict(),
                 'att_model_state_dict': att_model.state_dict(),
                 's': s,
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'loss': avg_loss,
+                'loss_history': loss_history,
             }, save_path)
             print(f"Checkpoint saved at epoch {epoch+1}")
 
             print("Running validation...")
             sdf_model.eval()
             att_model.eval()
-            
             val_save_dir = os.path.join(args.checkpoint_dir, f'val_epoch_{epoch+1}')
             os.makedirs(val_save_dir, exist_ok=True)
-            
-            for i, batch in enumerate(tqdm(val_loader, desc="Validation", leave=False)):
-                rays = batch['rays'].squeeze(0).to(device) # [W, H, 8]
-                projs = batch['projs'].squeeze(0).to(device) # [W, H]
-                img = render_image(rays, sdf_model, att_model, s, args.val_n_samples, chunk_size=args.val_chunk_size)
 
-                plt.figure(figsize=(10, 5))
-                plt.subplot(1, 2, 1)
-                plt.imshow(img.cpu().numpy().T, cmap='gray')
-                plt.title('Predicted')
-                plt.axis('off')
-                plt.subplot(1, 2, 2)
-                plt.imshow(torch.exp(-projs).cpu().numpy().T, cmap='gray')
-                plt.title('Ground Truth')
-                plt.axis('off')
-                plt.savefig(os.path.join(val_save_dir, f'val_{i}.png'))
-                plt.close()
+            with torch.no_grad():
+                for i, batch in enumerate(tqdm(val_loader, desc="Validation", leave=False)):
+                    rays = batch['rays'].squeeze(0).to(device) # [W, H, 8]
+                    projs = batch['projs'].squeeze(0).to(device) # [W, H]
+                    img = render_image(rays, sdf_model, att_model, s, args.val_n_samples, chunk_size=args.val_chunk_size)
+
+                    plt.figure(figsize=(10, 5))
+                    plt.subplot(1, 2, 1)
+                    plt.imshow(img.cpu().numpy().T, cmap='gray')
+                    plt.title('Predicted')
+                    plt.axis('off')
+                    plt.subplot(1, 2, 2)
+                    plt.imshow(torch.exp(-projs).cpu().numpy().T, cmap='gray')
+                    plt.title('Ground Truth')
+                    plt.axis('off')
+                    plt.savefig(os.path.join(val_save_dir, f'val_{i}.png'))
+                    plt.close()
             sdf_model.train()
             att_model.train()
 
         scheduler.step()
-
     print("Training completed!")
 
 if __name__ == "__main__":
