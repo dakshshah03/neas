@@ -1,5 +1,7 @@
 # NeAS: Neural Attenuation Fields
 Unofficial implementation of NeAS that works with TIGRE formatted data.
+This is still in progress, currently only having implemented frequency encoding and single material.
+
 
 ## Prerequisites
 
