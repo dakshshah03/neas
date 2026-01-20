@@ -1,5 +1,7 @@
 # NeAS: Neural Attenuation Fields
-Unofficial implementation of NeAS that works with TIGRE formatted data.
+Unofficial implementation of [NeAS](https://arxiv.org/abs/2503.07491)
+```Zhu, Chengrui, et al. "NeAS: 3D Reconstruction from X-ray Images using Neural Attenuation Surface." arXiv preprint arXiv:2503.07491 (2025).```
+that works with TIGRE formatted data.
 This is still in progress, currently only having implemented frequency encoding and single material.
 
 
