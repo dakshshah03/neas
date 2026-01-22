@@ -28,6 +28,10 @@ def parse_args():
     parser.add_argument("--val_chunk_size", type=int, default=4096, help="Chunk size for validation rendering")
     parser.add_argument("--val_n_samples", type=int, default=128, help="Number of samples per ray during validation (higher for better quality)")
     
+    parser.add_argument("--use_freq_reg", action="store_true", help="Enable frequency regularization (coarse-to-fine)")
+    parser.add_argument("--tau_start", type=float, default=2.0, help="Initial tau value for frequency regularization")
+    parser.add_argument("--warmup_iters", type=int, default=500, help="Number of warmup iterations before applying frequency regularization")
+    
     return parser.parse_args()
 
 def surface_boundary_function(d, s):
@@ -38,7 +42,7 @@ def volume_render_intensity(att_coeff, dists):
     I_hat = torch.exp(-mu_delta_sum) # [batch_size, n_rays]
     return I_hat
 
-def render_image(rays, sdf_model, att_model, s, n_samples, chunk_size=4096):
+def render_image(rays, sdf_model, att_model, s, n_samples, chunk_size=4096, tau=None):
     device = rays.device
     H, W, _ = rays.shape
     rays_flat = rays.reshape(-1, 8)
@@ -60,7 +64,7 @@ def render_image(rays, sdf_model, att_model, s, n_samples, chunk_size=4096):
             sampled_points = ray_origins.unsqueeze(1) + ray_directions.unsqueeze(1) * sample_depths.unsqueeze(-1)
             sampled_points_flat = sampled_points.reshape(-1, 3)
             
-            sdf_distances, feature_vector = sdf_model(sampled_points_flat)
+            sdf_distances, feature_vector = sdf_model(sampled_points_flat, tau=tau)
             boundary_values = surface_boundary_function(sdf_distances, s)
             attenuation_values = torch.nn.functional.softplus(att_model(feature_vector))
             
@@ -104,6 +108,15 @@ def train(args):
 
     loss_history = {'total': [], 'int': [], 'reg': []}
     print("Starting training...")
+    
+    # frequency encoding/coarse-to-fine stuff
+    total_iters = args.epochs * len(train_loader)
+    half_iters = total_iters // 2
+    
+    max_freq_L = sdf_model.encoder.N_freqs
+    
+    global_iter = 0
+    
     epoch_tqdm = tqdm(range(args.epochs), desc="Training")
     for epoch in epoch_tqdm:
         epoch_loss = 0.0
@@ -123,6 +136,23 @@ def train(args):
             
             batch_size, n_rays, _ = ray_origins.shape
             
+            # coarse-to-fine freq reg
+            tau = None
+            if args.use_freq_reg:
+                if global_iter < args.warmup_iters:
+                    tau = None
+                else:
+                    iters_after_warmup = global_iter - args.warmup_iters
+                    effective_half_iters = half_iters - args.warmup_iters
+                    
+                    if iters_after_warmup < effective_half_iters:
+                        progress = iters_after_warmup / effective_half_iters
+                        tau = args.tau_start + progress * (max_freq_L - args.tau_start)
+                    else:
+                        tau = float(max_freq_L)
+            
+            global_iter += 1
+            
             # ray point sampling stuff
             t_vals = torch.linspace(0., 1., steps=args.n_samples, device=device)
             sample_depths = near * (1. - t_vals) + far * t_vals
@@ -130,7 +160,7 @@ def train(args):
             sampled_points_flat = sampled_points.reshape(-1, 3)
             
             # Forward pass
-            sdf_distances, feature_vector = sdf_model(sampled_points_flat)
+            sdf_distances, feature_vector = sdf_model(sampled_points_flat, tau=tau)
             boundary_values = surface_boundary_function(sdf_distances, s)
             attenuation_values = torch.nn.functional.softplus(att_model(feature_vector))
             
@@ -145,7 +175,7 @@ def train(args):
             
             # eikonal reg
             pts_eikonal = sampled_points_flat.clone().detach().requires_grad_(True)
-            sdf_eikonal, _ = sdf_model(pts_eikonal)
+            sdf_eikonal, _ = sdf_model(pts_eikonal, tau=tau)
             sdf_sum = sdf_eikonal.sum()
             
             # calculates the gradient of the SDF field 
@@ -220,7 +250,7 @@ def train(args):
                 for i, batch in enumerate(tqdm(val_loader, desc="Validation", leave=False)):
                     rays = batch['rays'].squeeze(0).to(device) # [W, H, 8]
                     projs = batch['projs'].squeeze(0).to(device) # [W, H]
-                    img = render_image(rays, sdf_model, att_model, s, args.val_n_samples, chunk_size=args.val_chunk_size)
+                    img = render_image(rays, sdf_model, att_model, s, args.val_n_samples, chunk_size=args.val_chunk_size, tau=None)
 
                     plt.figure(figsize=(10, 5))
                     plt.subplot(1, 2, 1)

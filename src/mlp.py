@@ -17,6 +17,7 @@ class FreqEncoder(nn.Module):
         self.input_dim = input_dim
         self.include_input = include_input
         self.periodic_fns = periodic_fns
+        self.N_freqs = N_freqs
 
         self.output_dim = 0
         if self.include_input:
@@ -30,17 +31,38 @@ class FreqEncoder(nn.Module):
             freq_bands = torch.linspace(2. ** 0., 2. ** max_freq_log2, N_freqs)
 
         self.register_buffer('freq_bands', freq_bands)
+        
+        self.tau = None
 
-    def forward(self,
-                input):
+    def get_freq_weights(self, tau):
+        weights = torch.zeros(self.N_freqs, device=self.freq_bands.device)
+        
+        for k in range(self.N_freqs):
+            diff = tau - k
+            if diff < 0:
+                weights[k] = 0.0
+            elif 0 <= diff < 1:
+                weights[k] = (1 - torch.cos(torch.tensor(diff * np.pi))) / 2
+            else:
+                weights[k] = 1.0
+        
+        return weights
+
+    def forward(self, input, tau=None):
         out = []
         if self.include_input:
             out.append(input)
 
+        if tau is not None:
+            weights = self.get_freq_weights(tau)
+        else:
+            weights = torch.ones(self.N_freqs, device=self.freq_bands.device)
+
         for i in range(len(self.freq_bands)):
             freq = self.freq_bands[i]
+            weight = weights[i]
             for p_fn in self.periodic_fns:
-                out.append(p_fn(input * freq))
+                out.append(weight * p_fn(input * freq))
 
         out = torch.cat(out, dim=-1)
         
@@ -91,8 +113,8 @@ class SDFMLPWrapper(nn.Module):
         self.mlp = mlp
         self.feature_dim = feature_dim
     
-    def forward(self, x):
-        encoded = self.encoder(x)
+    def forward(self, x, tau=None):
+        encoded = self.encoder(x, tau=tau)
         output = self.mlp(encoded)
         distances = output[:, 0] 
         features = output[:, 1:1+self.feature_dim]
