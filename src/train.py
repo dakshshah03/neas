@@ -1,4 +1,4 @@
-from mlp import FreqEncoder, att_freq_mlp, sdf_freq_mlp
+from mlp import create_neas_model
 from dataset import TIGREDataset
 from torch.utils.data import DataLoader
 import torch
@@ -27,6 +27,16 @@ def parse_args():
     parser.add_argument("--s_param", type=float, default=20.0, help="Initial value for s (boundary sharpness) parameter")
     parser.add_argument("--val_chunk_size", type=int, default=4096, help="Chunk size for validation rendering")
     parser.add_argument("--val_n_samples", type=int, default=128, help="Number of samples per ray during validation (higher for better quality)")
+    
+    parser.add_argument("--alpha", type=float, default=1.0, help="Alpha parameter for attenuation activation function")
+    parser.add_argument("--beta", type=float, default=0.0, help="Beta parameter for attenuation activation function")
+    
+    parser.add_argument("--encoding", type=str, default="frequency", choices=["frequency", "hashgrid"], help="Encoding type: frequency or hashgrid")
+    parser.add_argument("--multires", type=int, default=6, help="Number of frequency bands for frequency encoding")
+    parser.add_argument("--num_levels", type=int, default=14, help="Number of levels for hash encoding")
+    parser.add_argument("--level_dim", type=int, default=2, help="Feature dimension per level for hash encoding")
+    parser.add_argument("--base_resolution", type=int, default=16, help="Base resolution for hash encoding")
+    parser.add_argument("--log2_hashmap_size", type=int, default=19, help="Log2 of hash table size")
     
     parser.add_argument("--use_freq_reg", action="store_true", help="Enable frequency regularization (coarse-to-fine)")
     parser.add_argument("--tau_start", type=float, default=2.0, help="Initial tau value for frequency regularization")
@@ -66,7 +76,7 @@ def render_image(rays, sdf_model, att_model, s, n_samples, chunk_size=4096, tau=
             
             sdf_distances, feature_vector = sdf_model(sampled_points_flat, tau=tau)
             boundary_values = surface_boundary_function(sdf_distances, s)
-            attenuation_values = torch.nn.functional.softplus(att_model(feature_vector))
+            attenuation_values = att_model(feature_vector)
             
             att_coeff = attenuation_values.squeeze(-1) * boundary_values
             att_coeff = att_coeff.reshape(chunk_rays.shape[0], n_samples)
@@ -93,9 +103,22 @@ def train(args):
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
+    print(f"Using encoding: {args.encoding}")
 
-    sdf_model = sdf_freq_mlp(input_dim=3, output_dim=1, feature_dim=args.feature_dim).to(device)
-    att_model = att_freq_mlp(input_dim=args.feature_dim, output_dim=1).to(device)
+    # Create models using the unified interface
+    sdf_model, att_model = create_neas_model(
+        encoding=args.encoding,
+        feature_dim=args.feature_dim,
+        alpha=args.alpha,
+        beta=args.beta,
+        multires=args.multires,
+        num_levels=args.num_levels,
+        level_dim=args.level_dim,
+        base_resolution=args.base_resolution,
+        log2_hashmap_size=args.log2_hashmap_size
+    )
+    sdf_model = sdf_model.to(device)
+    att_model = att_model.to(device)
 
     s = torch.tensor(args.s_param, requires_grad=True, device=device)
 
@@ -113,7 +136,11 @@ def train(args):
     total_iters = args.epochs * len(train_loader)
     half_iters = total_iters // 2
     
-    max_freq_L = sdf_model.encoder.N_freqs
+    # N_freqs is for frequency encoding
+    if args.encoding == 'frequency':
+        max_freq_L = sdf_model.encoder.N_freqs
+    else:
+        max_freq_L = None
     
     global_iter = 0
     
@@ -136,9 +163,9 @@ def train(args):
             
             batch_size, n_rays, _ = ray_origins.shape
             
-            # coarse-to-fine freq reg
+            # coarse-to-fine freq reg (only for frequency encoding)
             tau = None
-            if args.use_freq_reg:
+            if args.encoding == 'frequency' and args.use_freq_reg:
                 if global_iter < args.warmup_iters:
                     tau = None
                 else:
@@ -162,7 +189,7 @@ def train(args):
             # Forward pass
             sdf_distances, feature_vector = sdf_model(sampled_points_flat, tau=tau)
             boundary_values = surface_boundary_function(sdf_distances, s)
-            attenuation_values = torch.nn.functional.softplus(att_model(feature_vector))
+            attenuation_values = att_model(feature_vector)
             
             # attenuation coefficient
             att_coeff = attenuation_values.squeeze(-1) * boundary_values
@@ -233,6 +260,15 @@ def train(args):
                 'sdf_model_state_dict': sdf_model.state_dict(),
                 'att_model_state_dict': att_model.state_dict(),
                 's': s,
+                'encoding': args.encoding,
+                'feature_dim': args.feature_dim,
+                'alpha': args.alpha,
+                'beta': args.beta,
+                'multires': args.multires,
+                'num_levels': args.num_levels,
+                'level_dim': args.level_dim,
+                'base_resolution': args.base_resolution,
+                'log2_hashmap_size': args.log2_hashmap_size,
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'loss': avg_loss,

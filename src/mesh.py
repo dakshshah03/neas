@@ -4,7 +4,7 @@ import os
 import argparse
 from skimage.measure import marching_cubes
 
-from mlp import sdf_freq_mlp
+from mlp import create_neas_model
 
 def _save_ply(path, verts, faces):
     """Save a mesh to an ASCII PLY file (triangles).
@@ -125,15 +125,35 @@ def _choose_checkpoint(path_or_dir):
         raise FileNotFoundError(f'Checkpoint path not found: {path_or_dir}')
 
 
-def _load_sdf_model_from_checkpoint(checkpoint_path, feature_dim=8, device=None):
+def _load_sdf_model_from_checkpoint(checkpoint_path, feature_dim=None, device=None):
     if device is None:
         device = torch.device('cpu')
     ckpt = torch.load(checkpoint_path, map_location=device)
 
-    # create model (must match training feature_dim)
-    sdf_model = sdf_freq_mlp(input_dim=3, output_dim=1, feature_dim=feature_dim).to(device)
+    encoding = ckpt.get('encoding', 'frequency')
+    if feature_dim is None:
+        feature_dim = ckpt.get('feature_dim', 8)
+    alpha = ckpt.get('alpha', 1.0)
+    beta = ckpt.get('beta', 0.0)
+    multires = ckpt.get('multires', 6)
+    num_levels = ckpt.get('num_levels', 14)
+    level_dim = ckpt.get('level_dim', 2)
+    base_resolution = ckpt.get('base_resolution', 16)
+    log2_hashmap_size = ckpt.get('log2_hashmap_size', 19)
+    
+    sdf_model, _ = create_neas_model(
+        encoding=encoding,
+        feature_dim=feature_dim,
+        alpha=alpha,
+        beta=beta,
+        multires=multires,
+        num_levels=num_levels,
+        level_dim=level_dim,
+        base_resolution=base_resolution,
+        log2_hashmap_size=log2_hashmap_size
+    )
+    sdf_model = sdf_model.to(device)
 
-    # determine state dict
     if isinstance(ckpt, dict) and 'sdf_model_state_dict' in ckpt:
         state = ckpt['sdf_model_state_dict']
     else:
@@ -142,7 +162,6 @@ def _load_sdf_model_from_checkpoint(checkpoint_path, feature_dim=8, device=None)
     try:
         sdf_model.load_state_dict(state)
     except Exception:
-        # attempt non-strict load to allow missing keys (informative)
         sdf_model.load_state_dict(state, strict=False)
 
     return sdf_model, ckpt
@@ -151,7 +170,7 @@ def _load_sdf_model_from_checkpoint(checkpoint_path, feature_dim=8, device=None)
 def parse_cmdline():
     parser = argparse.ArgumentParser(description='Extract mesh from trained SDF model (.pth)')
     parser.add_argument('checkpoint', help='Path to .pth file or directory containing .pth files')
-    parser.add_argument('--feature_dim', type=int, default=8, help='Feature dimension used for the SDF model')
+    parser.add_argument('--feature_dim', type=int, default=None, help='Feature dimension used for the SDF model (default: load from checkpoint)')
     parser.add_argument('--bounds', type=float, nargs=6, default=[-1, -1, -1, 1, 1, 1],
                         help='Bounding box as x_min y_min z_min x_max y_max z_max')
     parser.add_argument('--resolution', type=int, default=256, help='Grid resolution per axis')

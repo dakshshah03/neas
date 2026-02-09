@@ -13,7 +13,7 @@ from tqdm import tqdm
 import re
 
 from train import render_image
-from mlp import att_freq_mlp, sdf_freq_mlp
+from mlp import create_neas_model
 
 from mesh import extract_mesh_from_sdf, _load_sdf_model_from_checkpoint
 
@@ -37,9 +37,31 @@ def get_predictions(model_path, data_dir, save_dir, device):
     """
     checkpoint = torch.load(model_path, map_location=device)
         
+    encoding = checkpoint.get('encoding', 'frequency')
     feature_dim = checkpoint.get('feature_dim', 8)
-    sdf_model = sdf_freq_mlp(input_dim=3, output_dim=1, feature_dim=feature_dim).to(device)
-    att_model = att_freq_mlp(input_dim=feature_dim, output_dim=1).to(device)
+    alpha = checkpoint.get('alpha', 1.0)
+    beta = checkpoint.get('beta', 0.0)
+    multires = checkpoint.get('multires', 6)
+    num_levels = checkpoint.get('num_levels', 14)
+    level_dim = checkpoint.get('level_dim', 2)
+    base_resolution = checkpoint.get('base_resolution', 16)
+    log2_hashmap_size = checkpoint.get('log2_hashmap_size', 19)
+    
+    # Create models
+    sdf_model, att_model = create_neas_model(
+        encoding=encoding,
+        feature_dim=feature_dim,
+        alpha=alpha,
+        beta=beta,
+        multires=multires,
+        num_levels=num_levels,
+        level_dim=level_dim,
+        base_resolution=base_resolution,
+        log2_hashmap_size=log2_hashmap_size
+    )
+    sdf_model = sdf_model.to(device)
+    att_model = att_model.to(device)
+    
     sdf_model.load_state_dict(checkpoint['sdf_model_state_dict'])
     att_model.load_state_dict(checkpoint['att_model_state_dict'])
     
