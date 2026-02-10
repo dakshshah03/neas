@@ -1,0 +1,29 @@
+exp:
+  expname: foot_50
+  expdir: ./checkpoints/
+  datadir: ./data/foot_50.pickle
+
+network:
+  feature_dim: 8
+  multires: 6
+  s_param: 20.0
+
+train:
+  epoch: 500
+  n_batch: 1
+  n_rays: 512
+  n_samples: 128
+  val_n_samples: 128
+  val_chunk_size: 4096
+  lrate: 0.001
+  lrate_gamma: 0.5
+  lrate_step: 50
+  lambda_reg: 0.01
+  resume: False
+  use_freq_reg: False
+  tau_start: 2.0
+  warmup_iters: 500
+
+log:
+  i_eval: 250  # Epoch for evaluation
+  i_save: 250  # Epoch for saving

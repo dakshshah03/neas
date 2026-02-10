@@ -12,8 +12,8 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import re
 
-from train import render_image
-from mlp import att_freq_mlp, sdf_freq_mlp
+from render import render_image
+from network import att_freq_mlp, sdf_freq_mlp
 
 from mesh import extract_mesh_from_sdf, _load_sdf_model_from_checkpoint
 

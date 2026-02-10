@@ -4,7 +4,7 @@ import os
 import argparse
 from skimage.measure import marching_cubes
 
-from mlp import sdf_freq_mlp
+from network import sdf_freq_mlp
 
 def _save_ply(path, verts, faces):
     """Save a mesh to an ASCII PLY file (triangles).
