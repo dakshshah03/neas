@@ -4,7 +4,7 @@ import os
 import argparse
 from skimage.measure import marching_cubes
 
-from network import sdf_freq_mlp
+from network import sdf_freq_mlp, sdf_hash_mlp
 
 def _save_ply(path, verts, faces):
     """Save a mesh to an ASCII PLY file (triangles).
@@ -130,8 +130,21 @@ def _load_sdf_model_from_checkpoint(checkpoint_path, feature_dim=8, device=None)
         device = torch.device('cpu')
     ckpt = torch.load(checkpoint_path, map_location=device)
 
-    # create model (must match training feature_dim)
-    sdf_model = sdf_freq_mlp(input_dim=3, output_dim=1, feature_dim=feature_dim).to(device)
+    encoding_type = ckpt.get('encoding_type', 'freq') if isinstance(ckpt, dict) else 'freq'
+    
+    if encoding_type == 'freq':
+        sdf_model = sdf_freq_mlp(input_dim=3, output_dim=1, feature_dim=feature_dim).to(device)
+    elif encoding_type == 'hash':
+        num_levels = ckpt.get('num_levels', 14) if isinstance(ckpt, dict) else 14
+        level_dim = ckpt.get('level_dim', 2) if isinstance(ckpt, dict) else 2
+        base_resolution = ckpt.get('base_resolution', 16) if isinstance(ckpt, dict) else 16
+        log2_hashmap_size = ckpt.get('log2_hashmap_size', 19) if isinstance(ckpt, dict) else 19
+        
+        sdf_model = sdf_hash_mlp(input_dim=3, output_dim=1, feature_dim=feature_dim,
+                                num_levels=num_levels, level_dim=level_dim,
+                                base_resolution=base_resolution, log2_hashmap_size=log2_hashmap_size).to(device)
+    else:
+        raise ValueError(f"Unknown encoding type: {encoding_type}")
 
     # determine state dict
     if isinstance(ckpt, dict) and 'sdf_model_state_dict' in ckpt:

@@ -67,7 +67,8 @@ def render_image(rays, sdf_model, att_model, s, n_samples, chunk_size=4096, tau=
             
             sdf_distances, feature_vector = sdf_model(sampled_points_flat, tau=tau)
             boundary_values = surface_boundary_function(sdf_distances, s)
-            attenuation_values = torch.nn.functional.softplus(att_model(feature_vector))
+            # Attenuation model now includes custom activation (alpha*sigmoid(x) + beta)
+            attenuation_values = att_model(feature_vector)
             
             att_coeff = attenuation_values.squeeze(-1) * boundary_values
             att_coeff = att_coeff.reshape(chunk_rays.shape[0], n_samples)

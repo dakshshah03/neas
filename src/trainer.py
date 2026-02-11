@@ -9,7 +9,7 @@ from shutil import copyfile
 import numpy as np
 
 from .dataset import TIGREDataset
-from .network import sdf_freq_mlp, att_freq_mlp
+from .network import sdf_freq_mlp, att_freq_mlp, sdf_hash_mlp, att_hash_mlp
 from .render import render_image, surface_boundary_function, volume_render_intensity
 from .utils import get_psnr, get_mse, get_psnr_3d, get_ssim_3d, cast_to_image
 
@@ -39,6 +39,10 @@ class Trainer:
         self.use_freq_reg = cfg["train"].get("use_freq_reg", False)
         self.tau_start = cfg["train"].get("tau_start", 2.0)
         self.warmup_iters = cfg["train"].get("warmup_iters", 500)
+        
+        # Pose refinement
+        self.use_pose_refinement = cfg["train"].get("use_pose_refinement", False)
+        self.pose_warmup_iters = cfg["train"].get("pose_warmup_iters", 500)
   
         # Log directory
         self.expdir = osp.join(cfg["exp"]["expdir"], cfg["exp"]["expname"])
@@ -52,19 +56,56 @@ class Trainer:
         train_dset = TIGREDataset(cfg["exp"]["datadir"], cfg["train"]["n_rays"], "train", device)
         self.eval_dset = TIGREDataset(cfg["exp"]["datadir"], cfg["train"]["n_rays"], "val", device) if self.i_eval > 0 else None
         self.train_dloader = torch.utils.data.DataLoader(train_dset, batch_size=cfg["train"]["n_batch"], shuffle=True)
+        
+        self.geo = train_dset.geo
+        self.n_train_images = train_dset.n_samples
     
         # Network
         feature_dim = cfg["network"].get("feature_dim", 8)
         multires = cfg["network"].get("multires", 6)
-        self.sdf_model = sdf_freq_mlp(input_dim=3, output_dim=1, feature_dim=feature_dim, multires=multires).to(device)
-        self.att_model = att_freq_mlp(input_dim=feature_dim, output_dim=1, multires=multires).to(device)
+        encoding_type = cfg["network"].get("encoding_type", "freq")  # 'freq' or 'hash'
         
-        # Boundary sharpness parameter
+        alpha = cfg["network"].get("alpha", 3.4)
+        beta = cfg["network"].get("beta", 0.1)
+        
+        if encoding_type == "freq":
+            self.sdf_model = sdf_freq_mlp(input_dim=3, output_dim=1, feature_dim=feature_dim, multires=multires).to(device)
+            self.att_model = att_freq_mlp(input_dim=feature_dim, output_dim=1, multires=multires, alpha=alpha, beta=beta).to(device)
+        elif encoding_type == "hash":
+            num_levels = cfg["network"].get("num_levels", 14)
+            level_dim = cfg["network"].get("level_dim", 2)
+            base_resolution = cfg["network"].get("base_resolution", 16)
+            log2_hashmap_size = cfg["network"].get("log2_hashmap_size", 19)
+            
+            self.sdf_model = sdf_hash_mlp(input_dim=3, output_dim=1, feature_dim=feature_dim,
+                                         num_levels=num_levels, level_dim=level_dim,
+                                         base_resolution=base_resolution, log2_hashmap_size=log2_hashmap_size).to(device)
+            self.att_model = att_hash_mlp(input_dim=feature_dim, output_dim=1,
+                                         num_levels=num_levels, level_dim=level_dim,
+                                         base_resolution=base_resolution, log2_hashmap_size=log2_hashmap_size,
+                                         alpha=alpha, beta=beta).to(device)
+        else:
+            raise ValueError(f"Unknown encoding type: {encoding_type}")
+        
+        self.encoding_type = encoding_type
+        
+        # Boundary sharpness parameter (learnable)
         s_param = cfg["network"].get("s_param", 20.0)
-        self.s = torch.tensor(s_param, requires_grad=True, device=device)
+        self.s = torch.nn.Parameter(torch.tensor(s_param, device=device))
+        
+        if self.use_pose_refinement:
+            self.pose_trans_delta = torch.nn.Parameter(torch.zeros(self.n_train_images, 3, device=device))
+            self.principal_point_delta = torch.nn.Parameter(torch.zeros(self.n_train_images, 2, device=device))
+        else:
+            self.pose_trans_delta = None
+            self.principal_point_delta = None
         
         # Optimizer
-        grad_vars = list(self.sdf_model.parameters()) + list(self.att_model.parameters())
+        grad_vars = list(self.sdf_model.parameters()) + list(self.att_model.parameters()) + [self.s]
+        
+        if self.use_pose_refinement:
+            grad_vars += [self.pose_trans_delta, self.principal_point_delta]
+        
         self.optimizer = torch.optim.Adam(params=grad_vars, lr=cfg["train"]["lrate"])
         self.lr_scheduler = torch.optim.lr_scheduler.StepLR(
             optimizer=self.optimizer, 
@@ -82,7 +123,10 @@ class Trainer:
             self.global_step = self.epoch_start * len(self.train_dloader)
             self.sdf_model.load_state_dict(ckpt["sdf_model_state_dict"])
             self.att_model.load_state_dict(ckpt["att_model_state_dict"])
-            self.s = ckpt["s"]
+            self.s.data = ckpt["s"]
+            if self.use_pose_refinement and "pose_trans_delta" in ckpt:
+                self.pose_trans_delta.data = ckpt["pose_trans_delta"]
+                self.principal_point_delta.data = ckpt["principal_point_delta"]
 
         # Summary writer
         self.writer = SummaryWriter(self.expdir)
@@ -116,9 +160,9 @@ class Trainer:
         
         batch_size, n_rays, _ = ray_origins.shape
         
-        # Coarse-to-fine frequency regularization
+        # Coarse-to-fine frequency regularization (only for frequency encoding)
         tau = None
-        if self.use_freq_reg:
+        if self.use_freq_reg and self.encoding_type == 'freq':
             if global_step < self.warmup_iters:
                 tau = None
             else:
@@ -144,7 +188,7 @@ class Trainer:
         # Forward pass
         sdf_distances, feature_vector = self.sdf_model(sampled_points_flat, tau=tau)
         boundary_values = surface_boundary_function(sdf_distances, self.s)
-        attenuation_values = torch.nn.functional.softplus(self.att_model(feature_vector))
+        attenuation_values = self.att_model(feature_vector)
         
         # Attenuation coefficient
         att_coeff = attenuation_values.squeeze(-1) * boundary_values
@@ -246,17 +290,34 @@ class Trainer:
             # Save checkpoint
             if (idx_epoch % self.i_save == 0 or idx_epoch == self.epochs) and idx_epoch > 0:
                 save_path = osp.join(self.expdir, f'checkpoint_epoch_{idx_epoch}.pth')
-                torch.save({
+                checkpoint_dict = {
                     'epoch': idx_epoch,
                     'args': self.conf,
                     'sdf_model_state_dict': self.sdf_model.state_dict(),
                     'att_model_state_dict': self.att_model.state_dict(),
-                    's': self.s,
+                    's': self.s.data,
                     'optimizer_state_dict': self.optimizer.state_dict(),
                     'scheduler_state_dict': self.lr_scheduler.state_dict(),
                     'loss_history': self.loss_history,
                     'feature_dim': self.conf["network"].get("feature_dim", 8),
-                }, save_path)
+                    'encoding_type': self.encoding_type,
+                    'alpha': self.conf["network"].get("alpha", 3.4),
+                    'beta': self.conf["network"].get("beta", 0.1),
+                }
+                
+                # Save hash encoding parameters if using hash encoding
+                if self.encoding_type == 'hash':
+                    checkpoint_dict['num_levels'] = self.conf["network"].get("num_levels", 14)
+                    checkpoint_dict['level_dim'] = self.conf["network"].get("level_dim", 2)
+                    checkpoint_dict['base_resolution'] = self.conf["network"].get("base_resolution", 16)
+                    checkpoint_dict['log2_hashmap_size'] = self.conf["network"].get("log2_hashmap_size", 19)
+                
+                # Save pose refinement parameters if enabled
+                if self.use_pose_refinement:
+                    checkpoint_dict['pose_trans_delta'] = self.pose_trans_delta.data
+                    checkpoint_dict['principal_point_delta'] = self.principal_point_delta.data
+                
+                torch.save(checkpoint_dict, save_path)
                 print(f"Checkpoint saved at epoch {idx_epoch}")
             
             if idx_epoch == self.epochs:

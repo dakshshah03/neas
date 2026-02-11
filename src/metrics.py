@@ -13,7 +13,7 @@ from tqdm import tqdm
 import re
 
 from render import render_image
-from network import att_freq_mlp, sdf_freq_mlp
+from network import att_freq_mlp, sdf_freq_mlp, att_hash_mlp, sdf_hash_mlp
 
 from mesh import extract_mesh_from_sdf, _load_sdf_model_from_checkpoint
 
@@ -38,12 +38,31 @@ def get_predictions(model_path, data_dir, save_dir, device):
     checkpoint = torch.load(model_path, map_location=device)
         
     feature_dim = checkpoint.get('feature_dim', 8)
-    sdf_model = sdf_freq_mlp(input_dim=3, output_dim=1, feature_dim=feature_dim).to(device)
-    att_model = att_freq_mlp(input_dim=feature_dim, output_dim=1).to(device)
+    encoding_type = checkpoint.get('encoding_type', 'freq')
+    alpha = checkpoint.get('alpha', 3.4)
+    beta = checkpoint.get('beta', 0.1)
+    
+    # Create networks based on encoding type
+    if encoding_type == 'freq':
+        sdf_model = sdf_freq_mlp(input_dim=3, output_dim=1, feature_dim=feature_dim).to(device)
+        att_model = att_freq_mlp(input_dim=feature_dim, output_dim=1, alpha=alpha, beta=beta).to(device)
+    elif encoding_type == 'hash':
+        num_levels = checkpoint.get('num_levels', 14)
+        level_dim = checkpoint.get('level_dim', 2)
+        base_resolution = checkpoint.get('base_resolution', 16)
+        log2_hashmap_size = checkpoint.get('log2_hashmap_size', 19)
+        
+        sdf_model = sdf_hash_mlp(input_dim=3, output_dim=1, feature_dim=feature_dim,
+                                num_levels=num_levels, level_dim=level_dim,
+                                base_resolution=base_resolution, log2_hashmap_size=log2_hashmap_size).to(device)
+        att_model = att_hash_mlp(input_dim=feature_dim, output_dim=1,
+                                num_levels=num_levels, level_dim=level_dim,
+                                base_resolution=base_resolution, log2_hashmap_size=log2_hashmap_size,
+                                alpha=alpha, beta=beta).to(device)
+    
     sdf_model.load_state_dict(checkpoint['sdf_model_state_dict'])
     att_model.load_state_dict(checkpoint['att_model_state_dict'])
     
-    s = checkpoint['s']
     
     sdf_model.eval()
     att_model.eval()
