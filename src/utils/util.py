@@ -1,58 +1,119 @@
 import numpy as np
 import torch
-from torchmetrics.image import StructuralSimilarityIndexMeasure, PeakSignalNoiseRatio
+from skimage.metrics import structural_similarity
 
+get_mse = lambda x, y: torch.mean((x - y) ** 2)
 
-def get_psnr(pred, gt):
-    """Compute PSNR between predicted and ground truth images."""
-    device = pred.device
-    psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
-    # Convert to [1, C, H, W] format
-    if pred.dim() == 2:
-        pred = pred.unsqueeze(0).unsqueeze(0)
-        gt = gt.unsqueeze(0).unsqueeze(0)
-    return psnr_metric(pred, gt).item()
-
-
-def get_mse(pred, gt):
-    """Compute MSE between predicted and ground truth."""
-    return torch.mean((pred - gt) ** 2).item()
-
-
-def get_ssim_3d(pred, gt):
-    """Compute SSIM for 3D volumes (computes per-slice and averages)."""
-    device = pred.device
-    ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
     
-    # Compute SSIM for each slice along the last dimension
-    n_slices = pred.shape[-1]
-    ssim_scores = []
-    
-    for i in range(n_slices):
-        pred_slice = pred[..., i].unsqueeze(0).unsqueeze(0)
-        gt_slice = gt[..., i].unsqueeze(0).unsqueeze(0)
-        ssim_scores.append(ssim_metric(pred_slice, gt_slice).item())
-    
-    return np.mean(ssim_scores)
+def get_psnr(x, y):
+    if torch.max(x) == 0 or torch.max(y) == 0:
+        return torch.zeros(1)
+    else:
+        x_norm = (x - torch.min(x)) / (torch.max(x) - torch.min(x))
+        y_norm = (y - torch.min(y)) / (torch.max(y) - torch.min(y))
+        mse = get_mse(x_norm, y_norm)
+        psnr = -10. * torch.log(mse) / torch.log(torch.Tensor([10.]).to(x.device))
+    return psnr
 
 
-def get_psnr_3d(pred, gt):
-    """Compute PSNR for 3D volumes."""
-    device = pred.device
-    psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
-    return psnr_metric(pred.unsqueeze(0).unsqueeze(0), gt.unsqueeze(0).unsqueeze(0)).item()
+def get_psnr_3d(arr1, arr2, size_average=True, PIXEL_MAX=1.0):
+    """
+    :param arr1:
+        Format-[DHW], OriImage [0,1]
+    :param arr2:
+        Format-[DHW], ComparedImage [0,1]
+    :return:
+        Format-None if size_average else [N]
+    """
+    if torch.is_tensor(arr1):
+        arr1 = arr1.cpu().detach().numpy()
+    if torch.is_tensor(arr2):
+        arr2 = arr2.cpu().detach().numpy()
+    arr1 = arr1[np.newaxis, ...]
+    arr2 = arr2[np.newaxis, ...]
+    arr1 = arr1.astype(np.float64)
+    arr2 = arr2.astype(np.float64)
+    eps = 1e-10
+    se = np.power(arr1 - arr2, 2)
+    mse = se.mean(axis=1).mean(axis=1).mean(axis=1)
+    zero_mse = np.where(mse == 0)
+    mse[zero_mse] = eps
+    psnr = 20 * np.log10(PIXEL_MAX / np.sqrt(mse))
+    # #zero mse, return 100
+    psnr[zero_mse] = 100
+
+    if size_average:
+        return psnr.mean()
+    else:
+        return psnr
 
 
-def cast_to_image(tensor):
-    """Convert tensor to numpy image in [0, 1] range."""
-    if isinstance(tensor, torch.Tensor):
-        tensor = tensor.detach().cpu().numpy()
+def get_ssim_3d(arr1, arr2, size_average=True, PIXEL_MAX=1.0):
+    """
+    :param arr1:
+        Format-[DHW], OriImage [0,1]
+    :param arr2:
+        Format-[DHW], ComparedImage [0,1]
+    :return:
+        Format-None if size_average else [N]
+    """
+    if torch.is_tensor(arr1):
+        arr1 = arr1.cpu().detach().numpy()
+    if torch.is_tensor(arr2):
+        arr2 = arr2.cpu().detach().numpy()
+    arr1 = arr1[np.newaxis, ...]
+    arr2 = arr2[np.newaxis, ...]
+    assert (arr1.ndim == 4) and (arr2.ndim == 4)
+    arr1 = arr1.astype(np.float64)
+    arr2 = arr2.astype(np.float64)
+
+    N = arr1.shape[0]
+    # Depth
+    arr1_d = np.transpose(arr1, (0, 2, 3, 1))
+    arr2_d = np.transpose(arr2, (0, 2, 3, 1))
+    ssim_d = []
+    for i in range(N):
+        ssim = structural_similarity(arr1_d[i], arr2_d[i], data_range=PIXEL_MAX)
+        ssim_d.append(ssim)
+    ssim_d = np.asarray(ssim_d, dtype=np.float64)
+
+    # Height
+    arr1_h = np.transpose(arr1, (0, 1, 3, 2))
+    arr2_h = np.transpose(arr2, (0, 1, 3, 2))
+    ssim_h = []
+    for i in range(N):
+        ssim = structural_similarity(arr1_h[i], arr2_h[i], data_range=PIXEL_MAX)
+        ssim_h.append(ssim)
+    ssim_h = np.asarray(ssim_h, dtype=np.float64)
+
+    # Width
+    # arr1_w = np.transpose(arr1, (0, 1, 2, 3))
+    # arr2_w = np.transpose(arr2, (0, 1, 2, 3))
+    ssim_w = []
+    for i in range(N):
+        ssim = structural_similarity(arr1[i], arr2[i], data_range=PIXEL_MAX)
+        ssim_w.append(ssim)
+    ssim_w = np.asarray(ssim_w, dtype=np.float64)
+
+    ssim_avg = (ssim_d + ssim_h + ssim_w) / 3
+
+    if size_average:
+        return ssim_avg.mean()
+    else:
+        return ssim_avg
+
+
+def cast_to_image(tensor, normalize=True):
+    """Convert tensor to numpy image."""
+    if torch.is_tensor(tensor):
+        img = tensor.cpu().detach().numpy()
+    else:
+        img = tensor
     
-    # Normalize to [0, 1]
-    tensor = (tensor - tensor.min()) / (tensor.max() - tensor.min() + 1e-8)
+    if normalize:
+        img = (img - img.min()) / (img.max() - img.min() + 1e-8)
     
-    # Add channel dimension if grayscale
-    if tensor.ndim == 2:
-        tensor = tensor[..., np.newaxis]
+    if img.ndim == 2:
+        img = img[..., np.newaxis]
     
-    return tensor
+    return img

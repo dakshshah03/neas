@@ -86,22 +86,9 @@ class TIGREDataset(Dataset):
         self.near, self.far = self.get_near_far(self.geo)
 
         if type == "train":
-            # Normalize projections: intensity in [0,1], background=1 (no attenuation)
-            # Raw projections are attenuation values: I = exp(-attenuation)
-            projs_raw = torch.tensor(data["train"]["projections"], dtype=torch.float32, device=device)
-            intensities = torch.exp(-projs_raw)
-            
-            # Background (max intensity) should be 1, foreground (min intensity) should be 0
-            intensity_max = intensities.max()  # Background (no attenuation)
-            intensity_min = intensities.min()  # Darkest point (most attenuation)
-            
-            # Normalize: background -> 1, darkest -> 0
-            if intensity_max > intensity_min:
-                intensities = (intensities - intensity_min) / (intensity_max - intensity_min)
-            
-            # Convert back to attenuation space: attenuation = -log(intensity)
-            # Background (intensity=1) -> attenuation=0, Dark areas (intensity→0) -> attenuation→∞
-            self.projs = -torch.log(intensities.clamp(min=1e-10))
+            self.projs = torch.tensor(
+                data["train"]["projections"], dtype=torch.float32, device=device
+            )
             
             angles = data["train"]["angles"]
             rays = self.get_rays(angles, self.geo, device)
@@ -138,20 +125,9 @@ class TIGREDataset(Dataset):
                 self.get_voxels(self.geo), dtype=torch.float32, device=device
             )
         elif type == "val":
-            # Normalize validation projections: intensity in [0,1], background=1 (no attenuation)
-            projs_raw = torch.tensor(data["val"]["projections"], dtype=torch.float32, device=device)
-            intensities = torch.exp(-projs_raw)
-            
-            # Background (max intensity) should be 1, foreground (min intensity) should be 0
-            intensity_max = intensities.max()  # Background (no attenuation)
-            intensity_min = intensities.min()  # Darkest point (most attenuation)
-            
-            # Normalize: background -> 1, darkest -> 0
-            if intensity_max > intensity_min:
-                intensities = (intensities - intensity_min) / (intensity_max - intensity_min)
-            
-            # Convert back to attenuation space
-            self.projs = -torch.log(intensities.clamp(min=1e-10))
+            self.projs = torch.tensor(
+                data["val"]["projections"], dtype=torch.float32, device=device
+            )
             
             angles = data["val"]["angles"]
             rays = self.get_rays(angles, self.geo, device)

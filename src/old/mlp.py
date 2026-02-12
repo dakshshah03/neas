@@ -41,43 +41,56 @@ class MLPBlock(nn.Module):
 
 class SDFMLPWrapper(nn.Module):
     """Wrapper for SDF MLP that returns distances and features separately"""
-    def __init__(self, encoder, mlp, feature_dim):
+    def __init__(self, encoder, shared_mlp, distance_head, feature_head, feature_dim):
         super().__init__()
         self.encoder = encoder
-        self.mlp = mlp
+        self.shared_mlp = shared_mlp
+        self.distance_head = distance_head
+        self.feature_head = feature_head
         self.feature_dim = feature_dim
     
     def forward(self, x, tau=None):
         # the external encoder expects `bound` (coarse-to-fine tau); map the name
         encoded = self.encoder(x, bound=tau)
-        output = self.mlp(encoded)
-        distances = output[:, 0] 
-        features = output[:, 1:1+self.feature_dim]
+        shared_features = self.shared_mlp(encoded)
+        
+        # Separate heads for distance and features
+        distances = self.distance_head(shared_features).squeeze(-1)  # [B]
+        features = self.feature_head(shared_features)  # [B, feature_dim]
+        
         return distances, features
 
 
 def sdf_freq_mlp(input_dim=3, output_dim=1, feature_dim=8, multires=6):
-    """SDF MLP with frequency encoding - returns (distances [B], features [B, K])"""
+    """SDF MLP with frequency encoding - returns (distances [B], features [B, K])
+    Uses separate heads for distance and features to decouple geometry and appearance learning.
+    """
     encoder = FreqEncoder(input_dim=input_dim, max_freq_log2=multires-1, N_freqs=multires, log_sampling=True, include_input=True)
-    mlp = MLPBlock(encoder.output_dim, 256, output_dim + feature_dim, 6)
-    return SDFMLPWrapper(encoder, mlp, feature_dim)
+    
+    # Shared backbone (all layers except the final output)
+    shared_layers = []
+    hidden_dim = 256
+    num_layers = 6
+    
+    # First layer
+    shared_layers.append(nn.Linear(encoder.output_dim, hidden_dim))
+    shared_layers.append(nn.ReLU(inplace=True))
+    
+    # Hidden layers (all but the last)
+    for _ in range(num_layers - 2):
+        shared_layers.append(nn.Linear(hidden_dim, hidden_dim))
+        shared_layers.append(nn.ReLU(inplace=True))
+    
+    shared_mlp = nn.Sequential(*shared_layers)
+    
+    # Separate output heads
+    distance_head = nn.Linear(hidden_dim, output_dim)
+    feature_head = nn.Linear(hidden_dim, feature_dim)
+    
+    return SDFMLPWrapper(encoder, shared_mlp, distance_head, feature_head, feature_dim)
 
 def att_freq_mlp(input_dim=3, output_dim=1, multires=6):
     """Attenuation MLP with frequency encoding, 256 hidden size"""
     encoder = FreqEncoder(input_dim=input_dim, max_freq_log2=multires-1, N_freqs=multires, log_sampling=True, include_input=True)
     mlp = MLPBlock(encoder.output_dim, 256, output_dim, 4)
     return nn.Sequential(encoder, mlp)
-
-
-# def sdf_hash_mlp(input_dim=3, output_dim=1):
-#     """SDF MLP with hash encoding - 2 layers, 64 hidden size"""
-#     encoder = HashEncoder(input_dim=input_dim)
-#     mlp = MLPBlock(encoder.out_dim, 64, output_dim, 2)
-#     return nn.Sequential(encoder, mlp)
-
-
-# def att_hash_mlp(input_dim=3, output_dim=1):
-#     """Attenuation MLP with hash encoding - 2 layers, 64 hidden size"""
-#     encoder = HashEncoder(input_dim=input_dim)
-#     mlp = MLPBlock(encoder.out_dim, 64, output_dim, 2)
-#     return nn.Sequential(encoder, mlp)

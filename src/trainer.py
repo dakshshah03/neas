@@ -7,9 +7,10 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm, trange
 from shutil import copyfile
 import numpy as np
+import wandb
 
 from .dataset import TIGREDataset
-from .network import sdf_freq_mlp, att_freq_mlp, sdf_hash_mlp, att_hash_mlp
+from .network import sdf_freq_mlp, att_freq_mlp, sdf_hash_mlp, att_hash_mlp, sdf_freq_mlp_2m, sdf_hash_mlp_2m, selector_function
 from .render import render_image, surface_boundary_function, volume_render_intensity
 from .utils import get_psnr, get_mse, get_psnr_3d, get_ssim_3d, cast_to_image
 
@@ -39,10 +40,15 @@ class Trainer:
         self.use_freq_reg = cfg["train"].get("use_freq_reg", False)
         self.tau_start = cfg["train"].get("tau_start", 2.0)
         self.warmup_iters = cfg["train"].get("warmup_iters", 500)
+        self.perturb = cfg["train"].get("perturb", True)
         
         # Pose refinement
         self.use_pose_refinement = cfg["train"].get("use_pose_refinement", False)
         self.pose_warmup_iters = cfg["train"].get("pose_warmup_iters", 500)
+        
+        self.use_wandb = cfg["log"].get("use_wandb", False)
+        self.wandb_project = cfg["log"].get("wandb_project", "neas")
+        self.wandb_entity = cfg["log"].get("wandb_entity", None)
   
         # Log directory
         self.expdir = osp.join(cfg["exp"]["expdir"], cfg["exp"]["expname"])
@@ -64,26 +70,58 @@ class Trainer:
         feature_dim = cfg["network"].get("feature_dim", 8)
         multires = cfg["network"].get("multires", 6)
         encoding_type = cfg["network"].get("encoding_type", "freq")  # 'freq' or 'hash'
+        num_materials = cfg["network"].get("num_materials", 1)  # 1 for 1M-NeAS, 2 for 2M-NeAS
         
-        alpha = cfg["network"].get("alpha", 3.4)
-        beta = cfg["network"].get("beta", 0.1)
+        # Activation function parameters for material 1
+        alpha1 = cfg["network"].get("alpha1", cfg["network"].get("alpha", 3.4))
+        beta1 = cfg["network"].get("beta1", cfg["network"].get("beta", 0.1))
         
+        # Activation function parameters for material 2 (only for 2M-NeAS)
+        alpha2 = cfg["network"].get("alpha2", 5.5)
+        beta2 = cfg["network"].get("beta2", 3.5)
+        
+        self.num_materials = num_materials
+        
+        # Create SDF network (single or dual output)
         if encoding_type == "freq":
-            self.sdf_model = sdf_freq_mlp(input_dim=3, output_dim=1, feature_dim=feature_dim, multires=multires).to(device)
-            self.att_model = att_freq_mlp(input_dim=feature_dim, output_dim=1, multires=multires, alpha=alpha, beta=beta).to(device)
+            if num_materials == 1:
+                self.sdf_model = sdf_freq_mlp(input_dim=3, output_dim=1, feature_dim=feature_dim, multires=multires).to(device)
+            else:
+                self.sdf_model = sdf_freq_mlp_2m(input_dim=3, output_dim=2, feature_dim=feature_dim, multires=multires).to(device)
+            
+            self.att_model1 = att_freq_mlp(input_dim=feature_dim, output_dim=1, alpha=alpha1, beta=beta1).to(device)
+            if num_materials == 2:
+                self.att_model2 = att_freq_mlp(input_dim=feature_dim, output_dim=1, alpha=alpha2, beta=beta2).to(device)
+            else:
+                self.att_model2 = None
+                
         elif encoding_type == "hash":
             num_levels = cfg["network"].get("num_levels", 14)
             level_dim = cfg["network"].get("level_dim", 2)
             base_resolution = cfg["network"].get("base_resolution", 16)
             log2_hashmap_size = cfg["network"].get("log2_hashmap_size", 19)
             
-            self.sdf_model = sdf_hash_mlp(input_dim=3, output_dim=1, feature_dim=feature_dim,
-                                         num_levels=num_levels, level_dim=level_dim,
-                                         base_resolution=base_resolution, log2_hashmap_size=log2_hashmap_size).to(device)
-            self.att_model = att_hash_mlp(input_dim=feature_dim, output_dim=1,
-                                         num_levels=num_levels, level_dim=level_dim,
-                                         base_resolution=base_resolution, log2_hashmap_size=log2_hashmap_size,
-                                         alpha=alpha, beta=beta).to(device)
+            if num_materials == 1:
+                self.sdf_model = sdf_hash_mlp(input_dim=3, output_dim=1, feature_dim=feature_dim,
+                                             num_levels=num_levels, level_dim=level_dim,
+                                             base_resolution=base_resolution, log2_hashmap_size=log2_hashmap_size).to(device)
+            else:  # num_materials == 2
+                self.sdf_model = sdf_hash_mlp_2m(input_dim=3, output_dim=2, feature_dim=feature_dim,
+                                                num_levels=num_levels, level_dim=level_dim,
+                                                base_resolution=base_resolution, log2_hashmap_size=log2_hashmap_size).to(device)
+            
+            # Create attenuation network(s)
+            self.att_model1 = att_hash_mlp(input_dim=feature_dim, output_dim=1,
+                                          num_levels=num_levels, level_dim=level_dim,
+                                          base_resolution=base_resolution, log2_hashmap_size=log2_hashmap_size,
+                                          alpha=alpha1, beta=beta1).to(device)
+            if num_materials == 2:
+                self.att_model2 = att_hash_mlp(input_dim=feature_dim, output_dim=1,
+                                              num_levels=num_levels, level_dim=level_dim,
+                                              base_resolution=base_resolution, log2_hashmap_size=log2_hashmap_size,
+                                              alpha=alpha2, beta=beta2).to(device)
+            else:
+                self.att_model2 = None
         else:
             raise ValueError(f"Unknown encoding type: {encoding_type}")
         
@@ -101,8 +139,13 @@ class Trainer:
             self.principal_point_delta = None
         
         # Optimizer
-        grad_vars = list(self.sdf_model.parameters()) + list(self.att_model.parameters()) + [self.s]
+        grad_vars = list(self.sdf_model.parameters()) + list(self.att_model1.parameters()) + [self.s]
         
+        # Add second attenuation network parameters for 2M-NeAS
+        if self.num_materials == 2:
+            grad_vars += list(self.att_model2.parameters())
+        
+        # Add pose parameters to optimizer if pose refinement is enabled
         if self.use_pose_refinement:
             grad_vars += [self.pose_trans_delta, self.principal_point_delta]
         
@@ -122,15 +165,31 @@ class Trainer:
             self.optimizer.load_state_dict(ckpt["optimizer"])
             self.global_step = self.epoch_start * len(self.train_dloader)
             self.sdf_model.load_state_dict(ckpt["sdf_model_state_dict"])
-            self.att_model.load_state_dict(ckpt["att_model_state_dict"])
+            
+            if "att_model1_state_dict" in ckpt:
+                self.att_model1.load_state_dict(ckpt["att_model1_state_dict"])
+                if self.num_materials == 2 and "att_model2_state_dict" in ckpt:
+                    self.att_model2.load_state_dict(ckpt["att_model2_state_dict"])
+            elif "att_model_state_dict" in ckpt:
+                self.att_model1.load_state_dict(ckpt["att_model_state_dict"])
+            
             self.s.data = ckpt["s"]
             if self.use_pose_refinement and "pose_trans_delta" in ckpt:
                 self.pose_trans_delta.data = ckpt["pose_trans_delta"]
                 self.principal_point_delta.data = ckpt["principal_point_delta"]
 
-        # Summary writer
         self.writer = SummaryWriter(self.expdir)
         self.writer.add_text("parameters", self.args2string(cfg), global_step=0)
+        
+        if self.use_wandb:
+            wandb.init(
+                project=self.wandb_project,
+                entity=self.wandb_entity,
+                name=cfg["exp"]["expname"],
+                config=cfg,
+                dir=self.expdir
+            )
+            wandb.watch([self.sdf_model, self.att_model1], log="all", log_freq=100)
         
         # Loss history
         self.loss_history = {'total': [], 'int': [], 'reg': []}
@@ -160,18 +219,21 @@ class Trainer:
         
         batch_size, n_rays, _ = ray_origins.shape
         
-        # Coarse-to-fine frequency regularization (only for frequency encoding)
+        # Coarse-to-fine frequency regularization (paper Eq. 8-9, works for both freq and hash)
         tau = None
-        if self.use_freq_reg and self.encoding_type == 'freq':
+        if self.use_freq_reg:
             if global_step < self.warmup_iters:
                 tau = None
             else:
                 iters_after_warmup = global_step - self.warmup_iters
                 total_iters = self.epochs * len(self.train_dloader)
                 half_iters = total_iters // 2
-                effective_half_iters = half_iters - self.warmup_iters
+                effective_half_iters = max(half_iters - self.warmup_iters, 1)
                 
-                max_freq_L = self.sdf_model.encoder.N_freqs
+                if self.encoding_type == 'freq':
+                    max_freq_L = self.sdf_model.encoder.N_freqs
+                else:  # hash encoding: regularize over resolution levels
+                    max_freq_L = self.sdf_model.num_levels
                 
                 if iters_after_warmup < effective_half_iters:
                     progress = iters_after_warmup / effective_half_iters
@@ -179,23 +241,54 @@ class Trainer:
                 else:
                     tau = float(max_freq_L)
         
-        # Ray point sampling
+        # Stratified sampling (paper Section III-A2)
         t_vals = torch.linspace(0., 1., steps=self.n_samples, device=self.device)
-        sample_depths = near * (1. - t_vals) + far * t_vals
-        sampled_points = ray_origins.unsqueeze(2) + ray_directions.unsqueeze(2) * sample_depths.unsqueeze(-1)
+        z_vals = near * (1. - t_vals) + far * t_vals  # [batch, n_rays, n_samples]
+        
+        if self.perturb:
+            mids = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
+            upper = torch.cat([mids, z_vals[..., -1:]], dim=-1)
+            lower = torch.cat([z_vals[..., :1], mids], dim=-1)
+            t_rand = torch.rand(z_vals.shape, device=self.device)
+            z_vals = lower + (upper - lower) * t_rand
+        
+        sampled_points = ray_origins.unsqueeze(2) + ray_directions.unsqueeze(2) * z_vals.unsqueeze(-1)
         sampled_points_flat = sampled_points.reshape(-1, 3)
         
         # Forward pass
-        sdf_distances, feature_vector = self.sdf_model(sampled_points_flat, tau=tau)
-        boundary_values = surface_boundary_function(sdf_distances, self.s)
-        attenuation_values = self.att_model(feature_vector)
+        if self.num_materials == 1:
+            # 1M-NeAS: single SDF and single attenuation network
+            sdf_distances, feature_vector = self.sdf_model(sampled_points_flat, tau=tau)
+            boundary_values = surface_boundary_function(sdf_distances, self.s)
+            attenuation_values = self.att_model1(feature_vector)
+            
+            # Attenuation coefficient
+            att_coeff = attenuation_values.squeeze(-1) * boundary_values
+        else:
+            # 2M-NeAS: dual SDFs and dual attenuation networks
+            d1, d2, feature_vector = self.sdf_model(sampled_points_flat, tau=tau)
+            
+            # Compute boundary values for both materials
+            boundary_values1 = surface_boundary_function(d1, self.s)
+            boundary_values2 = surface_boundary_function(d2, self.s)
+            
+            # Compute attenuation from both networks (both use same feature vector)
+            attenuation_values1 = self.att_model1(feature_vector)
+            attenuation_values2 = self.att_model2(feature_vector)
+            
+            # Apply boundary functions
+            mu1 = attenuation_values1.squeeze(-1) * boundary_values1
+            mu2 = attenuation_values2.squeeze(-1) * boundary_values2
+            
+            # Use selector function to choose between mu1 and mu2 based on d2
+            att_coeff = selector_function(d2, mu1, mu2)
         
-        # Attenuation coefficient
-        att_coeff = attenuation_values.squeeze(-1) * boundary_values
         att_coeff = att_coeff.reshape(batch_size, n_rays, self.n_samples)
         
-        # Volume rendering
-        dists = (far - near) / self.n_samples
+        dists = z_vals[..., 1:] - z_vals[..., :-1]  # [batch, n_rays, n_samples-1]
+        dists = torch.cat([dists, torch.ones_like(dists[..., :1]) * 1e-10], dim=-1)  # [batch, n_rays, n_samples]
+        dists = dists * torch.norm(ray_directions, dim=-1, keepdim=True)  # scale by ray direction norm
+        
         pred_intensity = volume_render_intensity(att_coeff, dists)
         gt_intensity = torch.exp(-projs)
         
@@ -204,17 +297,40 @@ class Trainer:
         
         # Eikonal regularization
         pts_eikonal = sampled_points_flat.clone().detach().requires_grad_(True)
-        sdf_eikonal, _ = self.sdf_model(pts_eikonal, tau=tau)
-        sdf_sum = sdf_eikonal.sum()
         
-        n = torch.autograd.grad(
-            outputs=sdf_sum,
-            inputs=pts_eikonal,
-            create_graph=True,
-        )[0]
-        
-        n_norm = torch.linalg.norm(n, dim=-1)
-        L_reg = torch.mean((n_norm - 1.0)**2)
+        if self.num_materials == 1:
+            sdf_eikonal, _ = self.sdf_model(pts_eikonal, tau=tau)
+            sdf_sum = sdf_eikonal.sum()
+            
+            n = torch.autograd.grad(
+                outputs=sdf_sum,
+                inputs=pts_eikonal,
+                create_graph=True,
+            )[0]
+            
+            n_norm = torch.linalg.norm(n, dim=-1)
+            L_reg = torch.mean((n_norm - 1.0)**2)
+        else:
+            d1_eikonal, d2_eikonal, _ = self.sdf_model(pts_eikonal, tau=tau)
+            
+            n1 = torch.autograd.grad(
+                outputs=d1_eikonal.sum(),
+                inputs=pts_eikonal,
+                create_graph=True,
+                retain_graph=True
+            )[0]
+            n1_norm = torch.linalg.norm(n1, dim=-1)
+            L_reg1 = torch.mean((n1_norm - 1.0)**2)
+            
+            n2 = torch.autograd.grad(
+                outputs=d2_eikonal.sum(),
+                inputs=pts_eikonal,
+                create_graph=True,
+            )[0]
+            n2_norm = torch.linalg.norm(n2, dim=-1)
+            L_reg2 = torch.mean((n2_norm - 1.0)**2)
+            
+            L_reg = (L_reg1 + L_reg2) / 2.0
         
         # Total loss
         L_total = L_int + self.lambda_reg * L_reg
@@ -230,25 +346,35 @@ class Trainer:
         self.writer.add_scalar("train/loss_int", L_int.item(), global_step)
         self.writer.add_scalar("train/loss_reg", L_reg.item(), global_step)
         
+        if self.use_wandb:
+            wandb.log({
+                "train/loss": L_total.item(),
+                "train/loss_int": L_int.item(),
+                "train/loss_reg": L_reg.item(),
+                "train/epoch": global_step / len(self.train_dloader)
+            }, step=global_step)
+        
         return loss
 
     def eval_step(self, global_step, idx_epoch):
-        """Evaluation step."""
+        """Evaluation step with projection and 3D volume metrics."""
         print("Running validation...")
         self.sdf_model.eval()
-        self.att_model.eval()
+        self.att_model1.eval()
+        if self.num_materials == 2:
+            self.att_model2.eval()
         
         val_save_dir = osp.join(self.expdir, f'val_epoch_{idx_epoch}')
         os.makedirs(val_save_dir, exist_ok=True)
 
         with torch.no_grad():
-            # Random projection
             select_ind = np.random.choice(len(self.eval_dset))
             rays = self.eval_dset.rays[select_ind].to(self.device)
             projs = self.eval_dset.projs[select_ind].to(self.device)
             
-            img = render_image(rays, self.sdf_model, self.att_model, self.s, 
-                             self.val_n_samples, chunk_size=self.val_chunk_size, tau=None)
+            img = render_image(rays, self.sdf_model, self.att_model1, self.s, 
+                             self.val_n_samples, chunk_size=self.val_chunk_size, tau=None, 
+                             att_model2=self.att_model2 if self.num_materials == 2 else None)
 
             # Visualization
             plt.figure(figsize=(10, 5))
@@ -263,16 +389,87 @@ class Trainer:
             plt.savefig(os.path.join(val_save_dir, f'val_{select_ind}.png'))
             plt.close()
             
-            # Compute metrics
-            proj_mse = get_mse(img, torch.exp(-projs))
-            proj_psnr = get_psnr(img, torch.exp(-projs))
+            proj_mse = get_mse(img, torch.exp(-projs)).item()
+            proj_psnr = get_psnr(img, torch.exp(-projs)).item()
+            
+            # Sample a 3D volume from the SDF
+            resolution = 128  # Use lower resolution for faster evaluation
+            bounds = ((-1., -1., -1.), (1., 1., 1.))
+            x_min, y_min, z_min = bounds[0]
+            x_max, y_max, z_max = bounds[1]
+            
+            xs = torch.linspace(x_min, x_max, resolution, device=self.device)
+            ys = torch.linspace(y_min, y_max, resolution, device=self.device)
+            zs = torch.linspace(z_min, z_max, resolution, device=self.device)
+            
+            grid_z, grid_y, grid_x = torch.meshgrid(zs, ys, xs, indexing='ij')
+            points = torch.stack([grid_x, grid_y, grid_z], dim=-1).reshape(-1, 3)
+            
+            batch_size = 4096
+            sdf_values = []
+            att_volume = []
+            for i in range(0, len(points), batch_size):
+                pts = points[i:i+batch_size]
+                if self.num_materials == 1:
+                    dists, features = self.sdf_model(pts)
+                    mu = self.att_model1(features)
+                    sdf_values.append(dists.squeeze(-1))
+                    att_volume.append(mu.squeeze(-1))
+                else:
+                    d1, d2, features = self.sdf_model(pts)
+                    mu1 = self.att_model1(features)
+                    mu2 = self.att_model2(features)
+                    from .network import selector_function
+                    mu = selector_function(d2, mu1, mu2)
+                    sdf_values.append(d1.squeeze(-1))
+                    att_volume.append(mu.squeeze(-1))
+            
+            sdf_volume = torch.cat(sdf_values, dim=0).reshape(resolution, resolution, resolution)
+            pred_att = torch.cat(att_volume, dim=0).reshape(resolution, resolution, resolution)
+            
+            inside_mask = (sdf_volume <= 0).float()
+            pred_volume = pred_att * inside_mask + pred_att.min() * (1 - inside_mask)
+            
+            pred_volume = (pred_volume - pred_volume.min()) / (pred_volume.max() - pred_volume.min() + 1e-8)
+            
+            gt_image = self.eval_dset.image  # [256, 256, 256] in original voxel space
+            
+            gt_volume_fullres = gt_image.unsqueeze(0).unsqueeze(0) 
+            gt_volume_resized = torch.nn.functional.interpolate(
+                gt_volume_fullres, 
+                size=(resolution, resolution, resolution), 
+                mode='trilinear', 
+                align_corners=True
+            ).squeeze(0).squeeze(0)  # [resolution, resolution, resolution]
+            
+            gt_volume = gt_volume_resized.clamp(0, 1)
+            
+            vol_psnr_3d = get_psnr_3d(pred_volume, gt_volume)
+            vol_ssim_3d = get_ssim_3d(pred_volume, gt_volume)
             
             self.writer.add_scalar("eval/proj_mse", proj_mse, global_step)
             self.writer.add_scalar("eval/proj_psnr", proj_psnr, global_step)
+            self.writer.add_scalar("eval/3d_psnr", vol_psnr_3d, global_step)
+            self.writer.add_scalar("eval/3d_ssim", vol_ssim_3d, global_step)
             self.writer.add_image("eval/proj_pred", cast_to_image(img.cpu().numpy().T), global_step, dataformats="HWC")
             
+            if self.use_wandb:
+                wandb.log({
+                    "eval/proj_mse": proj_mse,
+                    "eval/proj_psnr": proj_psnr,
+                    "eval/3d_psnr": vol_psnr_3d,
+                    "eval/3d_ssim": vol_ssim_3d,
+                    "eval/epoch": idx_epoch,
+                    "eval/proj_pred": wandb.Image(img.cpu().numpy().T, caption=f"Prediction - Epoch {idx_epoch}"),
+                    "eval/proj_gt": wandb.Image(torch.exp(-projs).cpu().numpy().T, caption=f"Ground Truth - Epoch {idx_epoch}")
+                }, step=global_step)
+                
+            print(f"Eval metrics - Proj MSE: {proj_mse:.6f}, Proj PSNR: {proj_psnr:.2f}, 3D PSNR: {vol_psnr_3d:.2f}, 3D SSIM: {vol_ssim_3d:.4f}")
+            
         self.sdf_model.train()
-        self.att_model.train()
+        self.att_model1.train()
+        if self.num_materials == 2:
+            self.att_model2.train()
 
     def start(self):
         """Main training loop."""
@@ -294,25 +491,29 @@ class Trainer:
                     'epoch': idx_epoch,
                     'args': self.conf,
                     'sdf_model_state_dict': self.sdf_model.state_dict(),
-                    'att_model_state_dict': self.att_model.state_dict(),
+                    'att_model1_state_dict': self.att_model1.state_dict(),
                     's': self.s.data,
                     'optimizer_state_dict': self.optimizer.state_dict(),
                     'scheduler_state_dict': self.lr_scheduler.state_dict(),
                     'loss_history': self.loss_history,
                     'feature_dim': self.conf["network"].get("feature_dim", 8),
                     'encoding_type': self.encoding_type,
-                    'alpha': self.conf["network"].get("alpha", 3.4),
-                    'beta': self.conf["network"].get("beta", 0.1),
+                    'num_materials': self.num_materials,
+                    'alpha1': self.conf["network"].get("alpha1", self.conf["network"].get("alpha", 3.4)),
+                    'beta1': self.conf["network"].get("beta1", self.conf["network"].get("beta", 0.1)),
                 }
                 
-                # Save hash encoding parameters if using hash encoding
+                if self.num_materials == 2:
+                    checkpoint_dict['att_model2_state_dict'] = self.att_model2.state_dict()
+                    checkpoint_dict['alpha2'] = self.conf["network"].get("alpha2", 5.5)
+                    checkpoint_dict['beta2'] = self.conf["network"].get("beta2", 3.5)
+                
                 if self.encoding_type == 'hash':
                     checkpoint_dict['num_levels'] = self.conf["network"].get("num_levels", 14)
                     checkpoint_dict['level_dim'] = self.conf["network"].get("level_dim", 2)
                     checkpoint_dict['base_resolution'] = self.conf["network"].get("base_resolution", 16)
                     checkpoint_dict['log2_hashmap_size'] = self.conf["network"].get("log2_hashmap_size", 19)
                 
-                # Save pose refinement parameters if enabled
                 if self.use_pose_refinement:
                     checkpoint_dict['pose_trans_delta'] = self.pose_trans_delta.data
                     checkpoint_dict['principal_point_delta'] = self.principal_point_delta.data
@@ -373,3 +574,6 @@ class Trainer:
 
         pbar.close()
         print("Training completed!")
+        
+        if self.use_wandb:
+            wandb.finish()
