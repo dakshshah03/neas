@@ -21,16 +21,17 @@ import csv
 import torch
 import numpy as np
 
-# Ensure `src` modules are importable
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
+proj_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if proj_root not in sys.path:
+    sys.path.insert(0, proj_root)
 
-from dataset.tigre import TIGREDataset
-from render.render import render_image, surface_boundary_function
-from network import (
-    sdf_freq_mlp, att_freq_mlp,
-    sdf_hash_mlp, att_hash_mlp, selector_function
+from src.dataset.tigre import TIGREDataset
+from src.render.render import render_image, surface_boundary_function
+from src.network import (
+    sdf_freq_mlp, sdf_freq_mlp_2m, att_freq_mlp,
+    sdf_hash_mlp, sdf_hash_mlp_2m, att_hash_mlp, selector_function
 )
-from utils.util import get_psnr, get_ssim, get_psnr_3d, get_ssim_3d
+from src.utils.util import get_psnr, get_ssim, get_psnr_3d, get_ssim_3d
 
 
 def _build_models_from_checkpoint(ckpt, device):
@@ -47,9 +48,13 @@ def _build_models_from_checkpoint(ckpt, device):
         if num_materials == 1:
             sdf_model = sdf_freq_mlp(input_dim=3, output_dim=1, feature_dim=feature_dim).to(device)
         else:
-            sdf_model = sdf_freq_mlp(input_dim=3, output_dim=2, feature_dim=feature_dim).to(device)
+            sdf_model = sdf_freq_mlp_2m(input_dim=3, output_dim=2, feature_dim=feature_dim).to(device)
         att_model1 = att_freq_mlp(input_dim=feature_dim, output_dim=1, alpha=alpha1, beta=beta1).to(device)
-        att_model2 = None
+        if num_materials == 2:
+            att_model2 = att_freq_mlp(input_dim=feature_dim, output_dim=1,
+                                      alpha=ckpt.get('alpha2', 5.5), beta=ckpt.get('beta2', 3.5)).to(device)
+        else:
+            att_model2 = None
     else:  # hash
         num_levels = ckpt.get('num_levels', 14)
         level_dim = ckpt.get('level_dim', 2)
@@ -61,17 +66,22 @@ def _build_models_from_checkpoint(ckpt, device):
                                      num_levels=num_levels, level_dim=level_dim,
                                      base_resolution=base_resolution, log2_hashmap_size=log2_hashmap_size).to(device)
         else:
-            sdf_model = sdf_hash_mlp(input_dim=3, output_dim=2, feature_dim=feature_dim,
-                                     num_levels=num_levels, level_dim=level_dim,
-                                     base_resolution=base_resolution, log2_hashmap_size=log2_hashmap_size).to(device)
+            sdf_model = sdf_hash_mlp_2m(input_dim=3, output_dim=2, feature_dim=feature_dim,
+                                        num_levels=num_levels, level_dim=level_dim,
+                                        base_resolution=base_resolution, log2_hashmap_size=log2_hashmap_size).to(device)
 
         att_model1 = att_hash_mlp(input_dim=feature_dim, output_dim=1,
                                   num_levels=num_levels, level_dim=level_dim,
                                   base_resolution=base_resolution, log2_hashmap_size=log2_hashmap_size,
                                   alpha=alpha1, beta=beta1).to(device)
-        att_model2 = None
+        if num_materials == 2:
+            att_model2 = att_hash_mlp(input_dim=feature_dim, output_dim=1,
+                                      num_levels=num_levels, level_dim=level_dim,
+                                      base_resolution=base_resolution, log2_hashmap_size=log2_hashmap_size,
+                                      alpha=ckpt.get('alpha2', 5.5), beta=ckpt.get('beta2', 3.5)).to(device)
+        else:
+            att_model2 = None
 
-    # Load weights (be permissive with key names used across checkpoints)
     sdf_state = None
     if 'sdf_model_state_dict' in ckpt:
         sdf_state = ckpt['sdf_model_state_dict']
@@ -81,7 +91,6 @@ def _build_models_from_checkpoint(ckpt, device):
     if sdf_state is not None:
         sdf_model.load_state_dict(sdf_state)
 
-    # attenuation weights: support 'att_model1_state_dict' or older 'att_model_state_dict'
     att_state = None
     if 'att_model1_state_dict' in ckpt:
         att_state = ckpt['att_model1_state_dict']
@@ -91,20 +100,22 @@ def _build_models_from_checkpoint(ckpt, device):
     if att_state is not None:
         att_model1.load_state_dict(att_state)
 
-    # second attenuation net for 2M
-    if num_materials == 2:
-        if 'att_model2_state_dict' in ckpt:
-            att_model2 = att_hash_mlp(input_dim=feature_dim, output_dim=1,
-                                      num_levels=num_levels, level_dim=level_dim,
-                                      base_resolution=base_resolution, log2_hashmap_size=log2_hashmap_size,
-                                      alpha=ckpt.get('alpha2', 5.5), beta=ckpt.get('beta2', 3.5)).to(device)
-            att_model2.load_state_dict(ckpt['att_model2_state_dict'])
+    if num_materials == 2 and 'att_model2_state_dict' in ckpt:
+        if att_model2 is None:
+            if encoding_type == 'freq':
+                att_model2 = att_freq_mlp(input_dim=feature_dim, output_dim=1,
+                                          alpha=ckpt.get('alpha2', 5.5), beta=ckpt.get('beta2', 3.5)).to(device)
+            else:
+                att_model2 = att_hash_mlp(input_dim=feature_dim, output_dim=1,
+                                          num_levels=ckpt.get('num_levels', 14), level_dim=ckpt.get('level_dim', 2),
+                                          base_resolution=ckpt.get('base_resolution', 16), log2_hashmap_size=ckpt.get('log2_hashmap_size', 19),
+                                          alpha=ckpt.get('alpha2', 5.5), beta=ckpt.get('beta2', 3.5)).to(device)
+        att_model2.load_state_dict(ckpt['att_model2_state_dict'])
 
     return sdf_model, att_model1, att_model2, float(s_param), int(num_materials)
 
 
 def sample_3d_volume_from_models(sdf_model, att_model1, att_model2, s_param, voxels, num_materials, chunk_size=8192, device='cuda'):
-    # voxels: torch tensor [n1, n2, n3, 3]
     n1, n2, n3, _ = voxels.shape
     total = n1 * n2 * n3
     voxels_flat = voxels.reshape(-1, 3).to(device)
@@ -148,6 +159,10 @@ def main():
     print(f"Checkpoint: {args.checkpoint}\nVal pickle: {args.val_pickle}\nDevice: {device}")
 
     ckpt = torch.load(args.checkpoint, map_location=device)
+
+    if ckpt.get('encoding_type', 'freq') == 'hash' and device == 'cpu':
+        raise RuntimeError("Checkpoint uses hash encoding which requires CUDA; run with --device cuda or use a freq-encoded checkpoint.")
+
     sdf_model, att_model1, att_model2, s_param, num_materials = _build_models_from_checkpoint(ckpt, device)
     sdf_model.eval(); att_model1.eval();
     if att_model2 is not None:
