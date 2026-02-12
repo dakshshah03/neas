@@ -70,10 +70,22 @@ echo "Using $NUM_GPUS CUDA devices: ${AVAILABLE_GPUS[*]}"
 export TORCH_CUDA_ARCH_LIST="8.6"
 
 configs=(
-    "./config/foot_configs/foot_50_1m_freq.yaml"
-    "./config/foot_configs/foot_50_2m_freq.yaml"
-    "./config/foot_configs/foot_50_1m_hash.yaml"
-    "./config/foot_configs/foot_50_2m_hash.yaml"
+    "./config/foot_configs/foot_50_1m_hash_pr.yaml"
+    "./config/foot_configs/foot_50_2m_hash_pr.yaml"
+    "./config/abdomen_configs/abdomen_50_1m_hash_pr.yaml"
+    "./config/abdomen_configs/abdomen_50_2m_hash_pr.yaml"
+    "./config/chest_configs/chest_50_1m_hash_pr.yaml"
+    "./config/chest_configs/chest_50_2m_hash_pr.yaml"
+    "./config/jaw_configs/jaw_50_1m_hash_pr.yaml"
+    "./config/jaw_configs/jaw_50_2m_hash_pr.yaml"
+    "./config/foot_configs/foot_50_1m_freq_pr.yaml"
+    "./config/foot_configs/foot_50_2m_freq_pr.yaml"
+    "./config/abdomen_configs/abdomen_50_1m_freq_pr.yaml"
+    "./config/abdomen_configs/abdomen_50_2m_freq_pr.yaml"
+    "./config/chest_configs/chest_50_1m_freq_pr.yaml"
+    "./config/chest_configs/chest_50_2m_freq_pr.yaml"
+    "./config/jaw_configs/jaw_50_1m_freq_pr.yaml"
+    "./config/jaw_configs/jaw_50_2m_freq_pr.yaml"
 )
 
 # Log file with timestamp

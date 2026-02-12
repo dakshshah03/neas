@@ -4,6 +4,43 @@ from skimage.metrics import structural_similarity
 
 get_mse = lambda x, y: torch.mean((x - y) ** 2)
 
+
+def get_ssim(arr1, arr2, PIXEL_MAX=None):
+    """
+    Calculate SSIM for 2D images.
+    
+    :param arr1:
+        Format-[H, W], OriImage
+    :param arr2:
+        Format-[H, W], ComparedImage
+    :param PIXEL_MAX:
+        If None (default), automatically computes data range as max(arr1.max(), arr2.max()) - min(arr1.min(), arr2.min())
+        If provided, uses this value as the data range
+    :return:
+        SSIM value
+    """
+    if torch.is_tensor(arr1):
+        arr1 = arr1.cpu().detach().numpy()
+    if torch.is_tensor(arr2):
+        arr2 = arr2.cpu().detach().numpy()
+    
+    arr1 = arr1.astype(np.float64)
+    arr2 = arr2.astype(np.float64)
+    
+    # Compute actual data range if not provided
+    if PIXEL_MAX is None:
+        data_max = max(arr1.max(), arr2.max())
+        data_min = min(arr1.min(), arr2.min())
+        data_range = data_max - data_min
+        # Avoid division by zero for constant images
+        if data_range < 1e-8:
+            data_range = 1.0
+    else:
+        data_range = PIXEL_MAX
+    
+    ssim = structural_similarity(arr1, arr2, data_range=data_range)
+    return ssim
+
     
 def get_psnr(x, y):
     if torch.max(x) == 0 or torch.max(y) == 0:
@@ -48,12 +85,15 @@ def get_psnr_3d(arr1, arr2, size_average=True, PIXEL_MAX=1.0):
         return psnr
 
 
-def get_ssim_3d(arr1, arr2, size_average=True, PIXEL_MAX=1.0):
+def get_ssim_3d(arr1, arr2, size_average=True, PIXEL_MAX=None):
     """
     :param arr1:
-        Format-[DHW], OriImage [0,1]
+        Format-[DHW], OriImage
     :param arr2:
-        Format-[DHW], ComparedImage [0,1]
+        Format-[DHW], ComparedImage
+    :param PIXEL_MAX:
+        If None (default), automatically computes data range from the data
+        If provided, uses this value as the data range
     :return:
         Format-None if size_average else [N]
     """
@@ -66,6 +106,17 @@ def get_ssim_3d(arr1, arr2, size_average=True, PIXEL_MAX=1.0):
     assert (arr1.ndim == 4) and (arr2.ndim == 4)
     arr1 = arr1.astype(np.float64)
     arr2 = arr2.astype(np.float64)
+    
+    # Compute actual data range if not provided
+    if PIXEL_MAX is None:
+        data_max = max(arr1.max(), arr2.max())
+        data_min = min(arr1.min(), arr2.min())
+        data_range = data_max - data_min
+        # Avoid division by zero for constant images
+        if data_range < 1e-8:
+            data_range = 1.0
+    else:
+        data_range = PIXEL_MAX
 
     N = arr1.shape[0]
     # Depth
@@ -73,7 +124,7 @@ def get_ssim_3d(arr1, arr2, size_average=True, PIXEL_MAX=1.0):
     arr2_d = np.transpose(arr2, (0, 2, 3, 1))
     ssim_d = []
     for i in range(N):
-        ssim = structural_similarity(arr1_d[i], arr2_d[i], data_range=PIXEL_MAX)
+        ssim = structural_similarity(arr1_d[i], arr2_d[i], data_range=data_range)
         ssim_d.append(ssim)
     ssim_d = np.asarray(ssim_d, dtype=np.float64)
 
@@ -82,7 +133,7 @@ def get_ssim_3d(arr1, arr2, size_average=True, PIXEL_MAX=1.0):
     arr2_h = np.transpose(arr2, (0, 1, 3, 2))
     ssim_h = []
     for i in range(N):
-        ssim = structural_similarity(arr1_h[i], arr2_h[i], data_range=PIXEL_MAX)
+        ssim = structural_similarity(arr1_h[i], arr2_h[i], data_range=data_range)
         ssim_h.append(ssim)
     ssim_h = np.asarray(ssim_h, dtype=np.float64)
 
@@ -91,7 +142,7 @@ def get_ssim_3d(arr1, arr2, size_average=True, PIXEL_MAX=1.0):
     # arr2_w = np.transpose(arr2, (0, 1, 2, 3))
     ssim_w = []
     for i in range(N):
-        ssim = structural_similarity(arr1[i], arr2[i], data_range=PIXEL_MAX)
+        ssim = structural_similarity(arr1[i], arr2[i], data_range=data_range)
         ssim_w.append(ssim)
     ssim_w = np.asarray(ssim_w, dtype=np.float64)
 

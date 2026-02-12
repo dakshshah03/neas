@@ -12,7 +12,7 @@ import wandb
 from .dataset import TIGREDataset
 from .network import sdf_freq_mlp, att_freq_mlp, sdf_hash_mlp, att_hash_mlp, sdf_freq_mlp_2m, sdf_hash_mlp_2m, selector_function
 from .render import render_image, surface_boundary_function, volume_render_intensity
-from .utils import get_psnr, get_mse, get_psnr_3d, get_ssim_3d, cast_to_image
+from .utils import get_psnr, get_mse, get_psnr_3d, get_ssim, get_ssim_3d, cast_to_image
 
 
 class Trainer:
@@ -356,9 +356,83 @@ class Trainer:
         
         return loss
 
+    def sample_3d_volume(self, chunk_size=8192):
+        """Sample a 3D volume from the learned SDF.
+        
+        This queries the network at each voxel position to reconstruct
+        the attenuation coefficient volume for comparison with ground truth.
+        
+        Args:
+            chunk_size: Number of voxels to process at once (to avoid OOM)
+            
+        Returns:
+            pred_volume: Predicted attenuation volume [n1, n2, n3]
+            gt_volume: Ground truth attenuation volume [n1, n2, n3]
+        """
+        print("Sampling 3D volume from SDF...")
+        
+        gt_volume = self.eval_dset.image.cpu().numpy()  # Shape: (n1, n2, n3)
+        voxels = self.eval_dset.voxels  # Shape: (n1, n2, n3, 3)
+        
+        n1, n2, n3, _ = voxels.shape
+        total_voxels = n1 * n2 * n3
+        
+        voxels_flat = voxels.reshape(-1, 3)  # Shape: (n1*n2*n3, 3)
+        voxels_flat = torch.tensor(voxels_flat, dtype=torch.float32, device=self.device)
+        
+        # Process in chunks to avoid OOM
+        pred_attenuation = []
+        
+        with torch.no_grad():
+            for i in range(0, total_voxels, chunk_size):
+                chunk_voxels = voxels_flat[i:i+chunk_size]
+                
+                if self.num_materials == 1:
+                    # 1M-NeAS: single SDF and single attenuation network
+                    sdf_distances, feature_vector = self.sdf_model(chunk_voxels, tau=None)
+                    boundary_values = surface_boundary_function(sdf_distances, self.s)
+                    attenuation_values = self.att_model1(feature_vector)
+                    
+                    # Attenuation coefficient = mu * boundary_function(d)
+                    att_coeff = attenuation_values.squeeze(-1) * boundary_values
+                    
+                else:
+                    # 2M-NeAS: dual SDFs and dual attenuation networks
+                    d1, d2, feature_vector = self.sdf_model(chunk_voxels, tau=None)
+                    
+                    # Compute boundary values for both materials
+                    boundary_values1 = surface_boundary_function(d1, self.s)
+                    boundary_values2 = surface_boundary_function(d2, self.s)
+                    
+                    # Compute attenuation from both networks
+                    attenuation_values1 = self.att_model1(feature_vector)
+                    attenuation_values2 = self.att_model2(feature_vector)
+                    
+                    # Apply boundary functions
+                    mu1 = attenuation_values1.squeeze(-1) * boundary_values1
+                    mu2 = attenuation_values2.squeeze(-1) * boundary_values2
+                    
+                    # Use selector function to choose between mu1 and mu2 based on d2
+                    from .network import selector_function
+                    att_coeff = selector_function(d2, mu1, mu2)
+                
+                pred_attenuation.append(att_coeff.cpu())
+                
+        # Concatenate all chunks and reshape to 3D volume
+        pred_attenuation = torch.cat(pred_attenuation, dim=0)
+        pred_volume = pred_attenuation.reshape(n1, n2, n3).numpy()
+        
+        print(f"Volume sampled: shape={pred_volume.shape}, "
+              f"pred range=[{pred_volume.min():.6f}, {pred_volume.max():.6f}], "
+              f"gt range=[{gt_volume.min():.6f}, {gt_volume.max():.6f}]")
+        
+        return pred_volume, gt_volume
+
     def eval_step(self, global_step, idx_epoch):
         """Evaluation step with projection and 3D volume metrics."""
         print("Running validation...")
+        torch.cuda.empty_cache()
+        
         self.sdf_model.eval()
         self.att_model1.eval()
         if self.num_materials == 2:
@@ -391,64 +465,17 @@ class Trainer:
             
             proj_mse = get_mse(img, torch.exp(-projs)).item()
             proj_psnr = get_psnr(img, torch.exp(-projs)).item()
+            proj_ssim = get_ssim(img, torch.exp(-projs)).item()
             
             # Sample a 3D volume from the SDF
-            resolution = 128  # Use lower resolution for faster evaluation
-            bounds = ((-1., -1., -1.), (1., 1., 1.))
-            x_min, y_min, z_min = bounds[0]
-            x_max, y_max, z_max = bounds[1]
-            
-            xs = torch.linspace(x_min, x_max, resolution, device=self.device)
-            ys = torch.linspace(y_min, y_max, resolution, device=self.device)
-            zs = torch.linspace(z_min, z_max, resolution, device=self.device)
-            
-            grid_z, grid_y, grid_x = torch.meshgrid(zs, ys, xs, indexing='ij')
-            points = torch.stack([grid_x, grid_y, grid_z], dim=-1).reshape(-1, 3)
-            
-            batch_size = 4096
-            sdf_values = []
-            att_volume = []
-            for i in range(0, len(points), batch_size):
-                pts = points[i:i+batch_size]
-                if self.num_materials == 1:
-                    dists, features = self.sdf_model(pts)
-                    mu = self.att_model1(features)
-                    sdf_values.append(dists.squeeze(-1))
-                    att_volume.append(mu.squeeze(-1))
-                else:
-                    d1, d2, features = self.sdf_model(pts)
-                    mu1 = self.att_model1(features)
-                    mu2 = self.att_model2(features)
-                    from .network import selector_function
-                    mu = selector_function(d2, mu1, mu2)
-                    sdf_values.append(d1.squeeze(-1))
-                    att_volume.append(mu.squeeze(-1))
-            
-            sdf_volume = torch.cat(sdf_values, dim=0).reshape(resolution, resolution, resolution)
-            pred_att = torch.cat(att_volume, dim=0).reshape(resolution, resolution, resolution)
-            
-            inside_mask = (sdf_volume <= 0).float()
-            pred_volume = pred_att * inside_mask + pred_att.min() * (1 - inside_mask)
-            
-            pred_volume = (pred_volume - pred_volume.min()) / (pred_volume.max() - pred_volume.min() + 1e-8)
-            
-            gt_image = self.eval_dset.image  # [256, 256, 256] in original voxel space
-            
-            gt_volume_fullres = gt_image.unsqueeze(0).unsqueeze(0) 
-            gt_volume_resized = torch.nn.functional.interpolate(
-                gt_volume_fullres, 
-                size=(resolution, resolution, resolution), 
-                mode='trilinear', 
-                align_corners=True
-            ).squeeze(0).squeeze(0)  # [resolution, resolution, resolution]
-            
-            gt_volume = gt_volume_resized.clamp(0, 1)
+            pred_volume, gt_volume = self.sample_3d_volume(chunk_size=8192)
             
             vol_psnr_3d = get_psnr_3d(pred_volume, gt_volume)
             vol_ssim_3d = get_ssim_3d(pred_volume, gt_volume)
             
             self.writer.add_scalar("eval/proj_mse", proj_mse, global_step)
             self.writer.add_scalar("eval/proj_psnr", proj_psnr, global_step)
+            self.writer.add_scalar("eval/proj_ssim", proj_ssim, global_step)
             self.writer.add_scalar("eval/3d_psnr", vol_psnr_3d, global_step)
             self.writer.add_scalar("eval/3d_ssim", vol_ssim_3d, global_step)
             self.writer.add_image("eval/proj_pred", cast_to_image(img.cpu().numpy().T), global_step, dataformats="HWC")
@@ -457,6 +484,7 @@ class Trainer:
                 wandb.log({
                     "eval/proj_mse": proj_mse,
                     "eval/proj_psnr": proj_psnr,
+                    "eval/proj_ssim": proj_ssim,
                     "eval/3d_psnr": vol_psnr_3d,
                     "eval/3d_ssim": vol_ssim_3d,
                     "eval/epoch": idx_epoch,
@@ -464,7 +492,7 @@ class Trainer:
                     "eval/proj_gt": wandb.Image(torch.exp(-projs).cpu().numpy().T, caption=f"Ground Truth - Epoch {idx_epoch}")
                 }, step=global_step)
                 
-            print(f"Eval metrics - Proj MSE: {proj_mse:.6f}, Proj PSNR: {proj_psnr:.2f}, 3D PSNR: {vol_psnr_3d:.2f}, 3D SSIM: {vol_ssim_3d:.4f}")
+            print(f"Eval metrics - Proj MSE: {proj_mse:.6f}, Proj PSNR: {proj_psnr:.2f}, Proj SSIM: {proj_ssim:.4f}, 3D PSNR: {vol_psnr_3d:.2f}, 3D SSIM: {vol_ssim_3d:.4f}")
             
         self.sdf_model.train()
         self.att_model1.train()
