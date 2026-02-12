@@ -1,10 +1,10 @@
 exp:
-  expname: jaw_50_1m_hash_pr
+  expname: jaw_50_1m_freq
   expdir: ./checkpoints/
   datadir: ./data/jaw_50.pickle
 
 network:
-  encoding_type: hash
+  encoding_type: freq
   num_materials: 1
   feature_dim: 8
   multires: 6
@@ -29,11 +29,10 @@ train:
   lambda_reg: 0.01
   resume: False
   perturb: True
-  use_freq_reg: False
+  use_freq_reg: True
   tau_start: 2.0
   warmup_iters: 500
-  use_pose_refinement: True
-  pose_warmup_iters: 500
+  warmup_epochs: 50
 
 log:
   i_eval: 50

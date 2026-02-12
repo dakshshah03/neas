@@ -42,10 +42,6 @@ class Trainer:
         self.warmup_iters = cfg["train"].get("warmup_iters", 500)
         self.perturb = cfg["train"].get("perturb", True)
         
-        # Pose refinement
-        self.use_pose_refinement = cfg["train"].get("use_pose_refinement", False)
-        self.pose_warmup_iters = cfg["train"].get("pose_warmup_iters", 500)
-        
         self.use_wandb = cfg["log"].get("use_wandb", False)
         self.wandb_project = cfg["log"].get("wandb_project", "neas")
         self.wandb_entity = cfg["log"].get("wandb_entity", None)
@@ -131,23 +127,11 @@ class Trainer:
         s_param = cfg["network"].get("s_param", 20.0)
         self.s = torch.nn.Parameter(torch.tensor(s_param, device=device))
         
-        if self.use_pose_refinement:
-            self.pose_trans_delta = torch.nn.Parameter(torch.zeros(self.n_train_images, 3, device=device))
-            self.principal_point_delta = torch.nn.Parameter(torch.zeros(self.n_train_images, 2, device=device))
-        else:
-            self.pose_trans_delta = None
-            self.principal_point_delta = None
-        
-        # Optimizer
         grad_vars = list(self.sdf_model.parameters()) + list(self.att_model1.parameters()) + [self.s]
         
-        # Add second attenuation network parameters for 2M-NeAS
         if self.num_materials == 2:
             grad_vars += list(self.att_model2.parameters())
         
-        # Add pose parameters to optimizer if pose refinement is enabled
-        if self.use_pose_refinement:
-            grad_vars += [self.pose_trans_delta, self.principal_point_delta]
         
         self.optimizer = torch.optim.Adam(params=grad_vars, lr=cfg["train"]["lrate"])
         self.lr_scheduler = torch.optim.lr_scheduler.StepLR(
@@ -174,9 +158,6 @@ class Trainer:
                 self.att_model1.load_state_dict(ckpt["att_model_state_dict"])
             
             self.s.data = ckpt["s"]
-            if self.use_pose_refinement and "pose_trans_delta" in ckpt:
-                self.pose_trans_delta.data = ckpt["pose_trans_delta"]
-                self.principal_point_delta.data = ckpt["principal_point_delta"]
 
         self.writer = SummaryWriter(self.expdir)
         self.writer.add_text("parameters", self.args2string(cfg), global_step=0)
@@ -541,10 +522,6 @@ class Trainer:
                     checkpoint_dict['level_dim'] = self.conf["network"].get("level_dim", 2)
                     checkpoint_dict['base_resolution'] = self.conf["network"].get("base_resolution", 16)
                     checkpoint_dict['log2_hashmap_size'] = self.conf["network"].get("log2_hashmap_size", 19)
-                
-                if self.use_pose_refinement:
-                    checkpoint_dict['pose_trans_delta'] = self.pose_trans_delta.data
-                    checkpoint_dict['principal_point_delta'] = self.principal_point_delta.data
                 
                 torch.save(checkpoint_dict, save_path)
                 print(f"Checkpoint saved at epoch {idx_epoch}")
