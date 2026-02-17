@@ -21,8 +21,8 @@ network:
 train:
   epoch: 1000
   n_batch: 1
-  n_rays: 1024
-  n_samples: 128
+  n_rays: 512
+  n_samples: 576
   val_n_samples: 128
   val_chunk_size: 1024
   lrate: 0.001
@@ -30,7 +30,6 @@ train:
   lrate_step: 500
   lambda_reg: 0.01
   resume: False
-  perturb: True
   use_freq_reg: False
   tau_start: 2.0
   warmup_iters: 500

@@ -40,7 +40,6 @@ class Trainer:
         self.use_freq_reg = cfg["train"].get("use_freq_reg", False)
         self.tau_start = cfg["train"].get("tau_start", 2.0)
         self.warmup_iters = cfg["train"].get("warmup_iters", 500)
-        self.perturb = cfg["train"].get("perturb", True)
         
         self.use_wandb = cfg["log"].get("use_wandb", False)
         self.wandb_project = cfg["log"].get("wandb_project", "neas")
@@ -201,37 +200,33 @@ class Trainer:
         batch_size, n_rays, _ = ray_origins.shape
         
         # Coarse-to-fine frequency regularization (paper Eq. 8-9, works for both freq and hash)
+        # Paper: τ starts at tau_start (2.0) and grows linearly to L until half of total iterations.
+        # Note: warmup_iters is for pose refinement (not implemented here), not for frequency regularization.
         tau = None
         if self.use_freq_reg:
-            if global_step < self.warmup_iters:
-                tau = None
+            total_iters = self.epochs * len(self.train_dloader)
+            half_iters = total_iters // 2
+            
+            if self.encoding_type == 'freq':
+                max_freq_L = self.sdf_model.encoder.N_freqs
+            else:  # hash encoding: regularize over resolution levels
+                max_freq_L = self.sdf_model.num_levels
+            
+            if half_iters > 0 and global_step < half_iters:
+                progress = global_step / half_iters
+                tau = self.tau_start + progress * (max_freq_L - self.tau_start)
             else:
-                iters_after_warmup = global_step - self.warmup_iters
-                total_iters = self.epochs * len(self.train_dloader)
-                half_iters = total_iters // 2
-                effective_half_iters = max(half_iters - self.warmup_iters, 1)
-                
-                if self.encoding_type == 'freq':
-                    max_freq_L = self.sdf_model.encoder.N_freqs
-                else:  # hash encoding: regularize over resolution levels
-                    max_freq_L = self.sdf_model.num_levels
-                
-                if iters_after_warmup < effective_half_iters:
-                    progress = iters_after_warmup / effective_half_iters
-                    tau = self.tau_start + progress * (max_freq_L - self.tau_start)
-                else:
-                    tau = float(max_freq_L)
+                tau = float(max_freq_L)
         
         # Stratified sampling (paper Section III-A2)
         t_vals = torch.linspace(0., 1., steps=self.n_samples, device=self.device)
         z_vals = near * (1. - t_vals) + far * t_vals  # [batch, n_rays, n_samples]
         
-        if self.perturb:
-            mids = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
-            upper = torch.cat([mids, z_vals[..., -1:]], dim=-1)
-            lower = torch.cat([z_vals[..., :1], mids], dim=-1)
-            t_rand = torch.rand(z_vals.shape, device=self.device)
-            z_vals = lower + (upper - lower) * t_rand
+        mids = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
+        upper = torch.cat([mids, z_vals[..., -1:]], dim=-1)
+        lower = torch.cat([z_vals[..., :1], mids], dim=-1)
+        t_rand = torch.rand(z_vals.shape, device=self.device)
+        z_vals = lower + (upper - lower) * t_rand
         
         sampled_points = ray_origins.unsqueeze(2) + ray_directions.unsqueeze(2) * z_vals.unsqueeze(-1)
         sampled_points_flat = sampled_points.reshape(-1, 3)

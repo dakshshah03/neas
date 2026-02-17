@@ -64,7 +64,7 @@ class FreqEncoder(nn.Module):
         for i, freq in enumerate(self.freq_bands):
             w = weights[i]
             for p_fn in self.periodic_fns:
-                out.append(p_fn(input * freq) * w)
+                out.append(p_fn(input * freq * math.pi) * w)
 
         out = torch.cat(out, dim=-1)
         return out

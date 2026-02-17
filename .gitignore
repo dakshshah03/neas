@@ -212,3 +212,4 @@ checkpoints/*
 *.ply
 
 neas_paper
+.ignore

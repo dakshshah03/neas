@@ -163,13 +163,13 @@ def att_freq_mlp(input_dim=8, output_dim=1, alpha=3.4, beta=0.1):
     The input is the feature vector f from the SDF network (paper Section III-A3),
     NOT spatial coordinates. No encoder is needed.
     
-    Paper: "three hidden layers, with a size of 256" -> 5 total layers.
+    Paper: "three hidden layers, with a size of 256" -> 4 total linear layers.
     
     Args:
         input_dim: Feature dimension K from SDF network
         alpha, beta: Activation parameters ensuring output in [beta, alpha+beta]
     """
-    mlp = MLPBlock(input_dim, 256, output_dim, 5)  # 5 layers: input + 3 hidden + output
+    mlp = MLPBlock(input_dim, 256, output_dim, 4)  # 4 layers: input + 2 hidden + output = 3 hidden layers
     activation = CustomActivation(alpha, beta)
     return nn.Sequential(mlp, activation)
 
