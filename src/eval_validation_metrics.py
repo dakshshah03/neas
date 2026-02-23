@@ -144,6 +144,20 @@ def sample_3d_volume_from_models(sdf_model, att_model1, att_model2, s_param, vox
     return pred_volume
 
 
+def normalize_volume(pred_volume, gt_volume):
+    """Normalize predicted volume to match GT scale via optimal least-squares factor.
+    
+    Finds scale s that minimizes ||s * pred - gt||^2:
+        s = (pred · gt) / (pred · pred)
+    """
+    dot_pp = np.sum(pred_volume * pred_volume)
+    if dot_pp > 0:
+        scale = np.sum(pred_volume * gt_volume) / dot_pp
+        print(f"Applied normalization scale factor: {scale:.4f}")
+        return pred_volume * scale
+    return pred_volume
+
+
 def main():
     parser = argparse.ArgumentParser(description="Compute average 2D/3D metrics over validation views")
     parser.add_argument('--checkpoint', '-c', required=True, help='Path to model checkpoint (.pth)')
@@ -200,6 +214,10 @@ def main():
     print("Sampling full 3D volume from model (this may take a while)...")
     pred_volume = sample_3d_volume_from_models(sdf_model, att_model1, att_model2, s_param, val_ds.voxels, num_materials, chunk_size=8192, device=device)
     gt_volume = val_ds.image.cpu().numpy()
+
+    print(f"Before normalization — pred range: [{pred_volume.min():.6f}, {pred_volume.max():.6f}], "
+          f"gt range: [{gt_volume.min():.6f}, {gt_volume.max():.6f}]")
+    pred_volume = normalize_volume(pred_volume, gt_volume)
 
     vol_psnr = float(get_psnr_3d(pred_volume, gt_volume))
     vol_ssim = float(get_ssim_3d(pred_volume, gt_volume))
