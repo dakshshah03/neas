@@ -9,7 +9,7 @@ network:
   feature_dim: 8
   multires: 6
   s_param: 20.0
-  alpha: 3.4
+  alpha: 10
   beta: 0.1
   num_levels: 14
   level_dim: 2
