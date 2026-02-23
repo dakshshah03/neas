@@ -42,7 +42,7 @@ class Trainer:
         self.warmup_iters = cfg["train"].get("warmup_iters", 500)
         
         self.use_wandb = cfg["log"].get("use_wandb", True)
-        self.wandb_project = cfg["log"].get("wandb_project", "neas")
+        self.wandb_project = cfg["log"].get("wandb_project", "neas_optimized_test")
         self.wandb_entity = cfg["log"].get("wandb_entity", None)
   
         # Log directory
@@ -190,8 +190,8 @@ class Trainer:
             Dictionary with losses
         """
         rays = batch_data['rays'].to(self.device)
-        projs = batch_data['projs'].to(self.device)
-        
+        gt_intensity = batch_data['projs_intensity'].to(self.device)
+
         ray_origins = rays[..., :3]
         ray_directions = rays[..., 3:6] 
         near = rays[..., 6:7]
@@ -229,7 +229,7 @@ class Trainer:
         z_vals = lower + (upper - lower) * t_rand
         
         sampled_points = ray_origins.unsqueeze(2) + ray_directions.unsqueeze(2) * z_vals.unsqueeze(-1)
-        sampled_points_flat = sampled_points.reshape(-1, 3)
+        sampled_points_flat = sampled_points.reshape(-1, 3).detach().requires_grad_(True)
         
         # Forward pass
         if self.num_materials == 1:
@@ -266,32 +266,23 @@ class Trainer:
         dists = dists * torch.norm(ray_directions, dim=-1, keepdim=True)  # scale by ray direction norm
         
         pred_intensity = volume_render_intensity(att_coeff, dists)
-        gt_intensity = torch.exp(-projs)
         
         # Intensity loss
         L_int = torch.nn.functional.mse_loss(pred_intensity, gt_intensity)
         
-        # Eikonal regularization
-        pts_eikonal = sampled_points_flat.clone().detach().requires_grad_(True)
-        
         if self.num_materials == 1:
-            sdf_eikonal, _ = self.sdf_model(pts_eikonal, tau=tau)
-            sdf_sum = sdf_eikonal.sum()
-            
             n = torch.autograd.grad(
-                outputs=sdf_sum,
-                inputs=pts_eikonal,
+                outputs=sdf_distances.sum(),
+                inputs=sampled_points_flat,
                 create_graph=True,
             )[0]
             
             n_norm = torch.linalg.norm(n, dim=-1)
             L_reg = torch.mean((n_norm - 1.0)**2)
         else:
-            d1_eikonal, d2_eikonal, _ = self.sdf_model(pts_eikonal, tau=tau)
-            
             n1 = torch.autograd.grad(
-                outputs=d1_eikonal.sum(),
-                inputs=pts_eikonal,
+                outputs=d1.sum(),
+                inputs=sampled_points_flat,
                 create_graph=True,
                 retain_graph=True
             )[0]
@@ -299,8 +290,8 @@ class Trainer:
             L_reg1 = torch.mean((n1_norm - 1.0)**2)
             
             n2 = torch.autograd.grad(
-                outputs=d2_eikonal.sum(),
-                inputs=pts_eikonal,
+                outputs=d2.sum(),
+                inputs=sampled_points_flat,
                 create_graph=True,
             )[0]
             n2_norm = torch.linalg.norm(n2, dim=-1)
@@ -347,14 +338,13 @@ class Trainer:
         """
         print("Sampling 3D volume from SDF...")
         
-        gt_volume = self.eval_dset.image.cpu().numpy()  # Shape: (n1, n2, n3)
+        gt_volume = self.eval_dset.image.cpu()  # Shape: (n1, n2, n3) — kept as a tensor
         voxels = self.eval_dset.voxels  # Shape: (n1, n2, n3, 3)
         
         n1, n2, n3, _ = voxels.shape
         total_voxels = n1 * n2 * n3
         
-        voxels_flat = voxels.reshape(-1, 3)  # Shape: (n1*n2*n3, 3)
-        voxels_flat = torch.tensor(voxels_flat, dtype=torch.float32, device=self.device)
+        voxels_flat = voxels.reshape(-1, 3).to(device=self.device, dtype=torch.float32)
         
         # Process in chunks to avoid OOM
         pred_attenuation = []
@@ -389,7 +379,6 @@ class Trainer:
                     mu2 = attenuation_values2.squeeze(-1) * boundary_values2
                     
                     # Use selector function to choose between mu1 and mu2 based on d2
-                    from .network import selector_function
                     att_coeff = selector_function(d2, mu1, mu2)
                 
                 pred_attenuation.append(att_coeff.cpu())
@@ -397,7 +386,6 @@ class Trainer:
         # Concatenate all chunks and reshape to 3D volume
         pred_attenuation = torch.cat(pred_attenuation, dim=0)
         pred_volume = pred_attenuation.reshape(n1, n2, n3)
-        gt_volume = torch.tensor(gt_volume, dtype=torch.float32) if not torch.is_tensor(gt_volume) else gt_volume
         
         print(f"Volume sampled: shape={tuple(pred_volume.shape)}, "
               f"pred range=[{pred_volume.min():.6f}, {pred_volume.max():.6f}], "
@@ -421,7 +409,7 @@ class Trainer:
         with torch.no_grad():
             select_ind = np.random.choice(len(self.eval_dset))
             rays = self.eval_dset.rays[select_ind].to(self.device)
-            projs = self.eval_dset.projs[select_ind].to(self.device)
+            projs_gt = self.eval_dset.projs_intensity[select_ind].to(self.device)
             
             img = render_image(rays, self.sdf_model, self.att_model1, self.s, 
                              self.val_n_samples, chunk_size=self.val_chunk_size, tau=None, 
@@ -434,13 +422,12 @@ class Trainer:
             plt.title('Predicted')
             plt.axis('off')
             plt.subplot(1, 2, 2)
-            plt.imshow(torch.exp(-projs).cpu().numpy().T, cmap='gray')
+            plt.imshow(projs_gt.cpu().numpy().T, cmap='gray')
             plt.title('Ground Truth')
             plt.axis('off')
             plt.savefig(os.path.join(val_save_dir, f'val_{select_ind}.png'))
             plt.close()
             
-            projs_gt = torch.exp(-projs)
             projs_pred = img
 
             proj_mse = get_mse(projs_pred, projs_gt).item()
@@ -474,7 +461,7 @@ class Trainer:
             for i_show in range(show_slice):
                 show.append(torch.concat([show_image[..., i_show], show_image_pred[..., i_show]], dim=0))
             show_density = torch.concat(show, dim=1)
-            show_proj = torch.concat([projs, projs_pred], dim=1)
+            show_proj = torch.concat([projs_gt, projs_pred], dim=1)
 
             self.writer.add_image("eval/density (row1: gt, row2: pred)", cast_to_image(show_density), global_step, dataformats="HWC")
             self.writer.add_image("eval/projection (left: gt, right: pred)", cast_to_image(show_proj), global_step, dataformats="HWC")
@@ -578,18 +565,18 @@ class Trainer:
             self.loss_history['int'].append(avg_int_loss)
             self.loss_history['reg'].append(self.lambda_reg * avg_reg_loss)
             
-            # Plot loss curve
-            plt.figure(figsize=(10, 5))
-            plt.plot(self.loss_history['total'], label='Total Loss')
-            plt.plot(self.loss_history['int'], label='Intensity Loss')
-            plt.plot(self.loss_history['reg'], label='Regularization Loss (Lambda scaled)')
-            plt.xlabel('Epoch')
-            plt.ylabel('Loss')
-            plt.title('Training Loss')
-            plt.legend()
-            plt.grid(True)
-            plt.savefig(os.path.join(self.expdir, 'loss_curve.png'))
-            plt.close()
+            if idx_epoch % 10 == 0:
+                plt.figure(figsize=(10, 5))
+                plt.plot(self.loss_history['total'], label='Total Loss')
+                plt.plot(self.loss_history['int'], label='Intensity Loss')
+                plt.plot(self.loss_history['reg'], label='Regularization Loss (Lambda scaled)')
+                plt.xlabel('Epoch')
+                plt.ylabel('Loss')
+                plt.title('Training Loss')
+                plt.legend()
+                plt.grid(True)
+                plt.savefig(os.path.join(self.expdir, 'loss_curve.png'))
+                plt.close()
             
             self.lr_scheduler.step()
 

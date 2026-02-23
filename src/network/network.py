@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import numpy as np
@@ -6,6 +7,28 @@ from typing import Callable, Tuple
 
 from ..encoder.freqencoder import FreqEncoder
 from ..encoder.hashencoder import HashEncoder
+
+
+def _make_hash_coarsefine_mask(tau, num_levels, level_dim, device, dtype):
+    """Build the coarse-to-fine annealing mask for hash-encoded features.
+
+    Replaces the per-call Python loop used in the original code with a
+    fully-vectorised torch operation, eliminating repeated list construction
+    and eager Python overhead on every forward pass.
+
+    Weight per level k:  w(k) = clamp01(sigmoid-step annealing of tau - k)
+        w = (1 - cos(clamp(tau - k, 0, 1) * π)) / 2
+    This matches the original logic exactly:
+        diff < 0  → w = 0    (level not yet unlocked)
+        0 ≤ diff < 1 → cosine ramp
+        diff ≥ 1  → w = 1    (level fully active)
+    Each scalar weight is then broadcast over its ``level_dim`` features via
+    repeat_interleave, giving a 1-D mask of length num_levels * level_dim.
+    """
+    k = torch.arange(num_levels, device=device, dtype=dtype)
+    diff = torch.clamp(tau - k, 0.0, 1.0)
+    w = (1.0 - torch.cos(diff * math.pi)) / 2.0   # shape: [num_levels]
+    return w.repeat_interleave(level_dim)           # shape: [num_levels * level_dim]
 
 
 class MLPBlock(nn.Module):
@@ -73,24 +96,16 @@ class SDFMLPWrapper(nn.Module):
         elif self.encoding_type == 'hash':
             encoded = self.encoder(x, size=1.0)
             if tau is not None and self.num_levels is not None and self.level_dim is not None:
-                import math
-                weights = []
-                for k in range(self.num_levels):
-                    diff = tau - k
-                    if diff < 0:
-                        w = 0.0
-                    elif diff < 1:
-                        w = (1.0 - math.cos(diff * math.pi)) / 2.0
-                    else:
-                        w = 1.0
-                    weights.extend([w] * self.level_dim)
-                mask = torch.tensor(weights, device=encoded.device, dtype=encoded.dtype)
+                mask = _make_hash_coarsefine_mask(
+                    tau, self.num_levels, self.level_dim,
+                    encoded.device, encoded.dtype
+                )
                 encoded = encoded * mask
         else:
             encoded = self.encoder(x)
-        
+
         output = self.mlp(encoded)
-        distances = output[:, 0] 
+        distances = output[:, 0]
         features = output[:, 1:1+self.feature_dim]
         return distances, features
 
@@ -118,22 +133,14 @@ class SDFMLPWrapper2M(nn.Module):
         elif self.encoding_type == 'hash':
             encoded = self.encoder(x, size=1.0)
             if tau is not None and self.num_levels is not None and self.level_dim is not None:
-                import math
-                weights = []
-                for k in range(self.num_levels):
-                    diff = tau - k
-                    if diff < 0:
-                        w = 0.0
-                    elif diff < 1:
-                        w = (1.0 - math.cos(diff * math.pi)) / 2.0
-                    else:
-                        w = 1.0
-                    weights.extend([w] * self.level_dim)
-                mask = torch.tensor(weights, device=encoded.device, dtype=encoded.dtype)
+                mask = _make_hash_coarsefine_mask(
+                    tau, self.num_levels, self.level_dim,
+                    encoded.device, encoded.dtype
+                )
                 encoded = encoded * mask
         else:
             encoded = self.encoder(x)
-        
+
         output = self.mlp(encoded)
         d1 = output[:, 0]  # First SDF (skin-air)
         d2 = output[:, 1]  # Second SDF (bone-muscle)

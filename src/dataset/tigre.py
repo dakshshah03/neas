@@ -89,6 +89,7 @@ class TIGREDataset(Dataset):
             self.projs = torch.tensor(
                 data["train"]["projections"], dtype=torch.float32, device=device
             )
+            self.projs_intensity = torch.exp(-self.projs)
             
             angles = data["train"]["angles"]
             rays = self.get_rays(angles, self.geo, device)
@@ -128,6 +129,7 @@ class TIGREDataset(Dataset):
             self.projs = torch.tensor(
                 data["val"]["projections"], dtype=torch.float32, device=device
             )
+            self.projs_intensity = torch.exp(-self.projs)
             
             angles = data["val"]["angles"]
             rays = self.get_rays(angles, self.geo, device)
@@ -158,15 +160,19 @@ class TIGREDataset(Dataset):
             select_coords = coords_valid[select_inds].long()
             rays = self.rays[index, select_coords[:, 0], select_coords[:, 1]]
             projs = self.projs[index, select_coords[:, 0], select_coords[:, 1]]
+            projs_intensity = self.projs_intensity[index, select_coords[:, 0], select_coords[:, 1]]
             out = {
                 "projs": projs,
+                "projs_intensity": projs_intensity,
                 "rays": rays,
             }
         elif self.type == "val":
             rays = self.rays[index]
             projs = self.projs[index]
+            projs_intensity = self.projs_intensity[index]
             out = {
                 "projs": projs,
+                "projs_intensity": projs_intensity,
                 "rays": rays,
             }
         return out

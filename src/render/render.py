@@ -3,15 +3,20 @@ import torch
 
 def surface_boundary_function(d, s):
     """Compute surface boundary values from SDF distances.
-    
+
+    Implements Ω(d, s) = exp(-s·d) / (1 + exp(-s·d)) from the paper (Eq. 2),
+    which is algebraically identical to sigmoid(-s·d).  Using torch.sigmoid
+    is preferred because PyTorch's numerically-stable log-sum-exp path avoids
+    overflow when s·d is large and positive.
+
     Args:
         d: SDF distance values
         s: boundary sharpness parameter
-        
+
     Returns:
-        Boundary values exp(-s*d)/(1 + exp(-s*d))
+        Boundary values in (0, 1); ≈1 inside surface (d<0), ≈0 outside (d>0)
     """
-    return torch.exp(-s*d)/(1 + torch.exp(-s*d))
+    return torch.sigmoid(-s * d)
 
 
 def volume_render_intensity(att_coeff, dists):
