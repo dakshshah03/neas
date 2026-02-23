@@ -29,6 +29,7 @@ train:
   lrate_gamma: 0.1
   lrate_step: 500
   lambda_reg: 0.01
+  num_views: 50
   resume: False
   use_freq_reg: False
   tau_start: 2.0

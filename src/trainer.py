@@ -54,7 +54,8 @@ class Trainer:
         os.makedirs(self.evaldir, exist_ok=True)
 
         # Dataset
-        train_dset = TIGREDataset(cfg["exp"]["datadir"], cfg["train"]["n_rays"], "train", device)
+        num_views = cfg["train"].get("num_views", None)
+        train_dset = TIGREDataset(cfg["exp"]["datadir"], cfg["train"]["n_rays"], "train", device, num_views=num_views)
         self.eval_dset = TIGREDataset(cfg["exp"]["datadir"], cfg["train"]["n_rays"], "val", device) if self.i_eval > 0 else None
         self.train_dloader = torch.utils.data.DataLoader(train_dset, batch_size=cfg["train"]["n_batch"], shuffle=True)
         

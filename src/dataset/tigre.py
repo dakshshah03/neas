@@ -57,7 +57,7 @@ class TIGREDataset(Dataset):
     TIGRE dataset.
     """
 
-    def __init__(self, path, n_rays=1024, type="train", device="cuda"):
+    def __init__(self, path, n_rays=1024, type="train", device="cuda", num_views=None):
         super().__init__()
 
         with open(path, "rb") as handle:
@@ -86,13 +86,21 @@ class TIGREDataset(Dataset):
         self.near, self.far = self.get_near_far(self.geo)
 
         if type == "train":
+            all_projs = data["train"]["projections"]
+            all_angles = data["train"]["angles"]
+            total_views = len(all_angles)
+
+            if num_views is not None and num_views < total_views:
+                indices = np.round(np.linspace(0, total_views - 1, num_views)).astype(int)
+                all_projs = all_projs[indices]
+                all_angles = all_angles[indices]
+
             self.projs = torch.tensor(
-                data["train"]["projections"], dtype=torch.float32, device=device
+                all_projs, dtype=torch.float32, device=device
             )
             self.projs_intensity = torch.exp(-self.projs)
             
-            angles = data["train"]["angles"]
-            rays = self.get_rays(angles, self.geo, device)
+            rays = self.get_rays(all_angles, self.geo, device)
             self.rays = torch.cat(
                 [
                     rays,
@@ -101,7 +109,7 @@ class TIGREDataset(Dataset):
                 ],
                 dim=-1,
             )
-            self.n_samples = data["numTrain"]
+            self.n_samples = len(all_angles)
             coords = torch.stack(
                 torch.meshgrid(
                     torch.linspace(
