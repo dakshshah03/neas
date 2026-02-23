@@ -20,6 +20,9 @@ import argparse
 import csv
 import torch
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')  # non-interactive backend; safe for headless servers
+import matplotlib.pyplot as plt
 
 proj_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if proj_root not in sys.path:
@@ -166,6 +169,10 @@ def main():
     parser.add_argument('--n_samples', type=int, default=128, help='Number of samples for rendering (2D)')
     parser.add_argument('--chunk_size', type=int, default=4096, help='Chunk size for rendering / 3D sampling')
     parser.add_argument('--save_csv', type=str, default=None, help='Optional CSV file to write per-view metrics')
+    parser.add_argument('--eval_id', type=str, default=None,
+                        help='Identifier/name for this evaluation (used to create subdirectory under eval/)')
+    parser.add_argument('--eval_root', type=str, default=None,
+                        help='Base directory where eval output will be stored (default: <project_root>/eval)')
     args = parser.parse_args()
 
     device = args.device if args.device is not None else ('cuda' if torch.cuda.is_available() else 'cpu')
@@ -191,28 +198,55 @@ def main():
     proj_psnrs = []
     proj_ssims = []
 
-    # loop over validation views
-    for i in range(n_views):
-        rays = val_ds.rays[i].to(device)       # [H, W, 8]
-        projs = val_ds.projs[i].to(device)     # [H, W]
+    # pre-compute once — avoids re-allocating a CUDA tensor on every iteration
+    s_tensor = torch.tensor(s_param, device=device)
 
-        with torch.no_grad():
-            pred_img = render_image(rays, sdf_model, att_model1, torch.tensor(s_param, device=device), args.n_samples, chunk_size=args.chunk_size, tau=None, att_model2=att_model2)
+    if args.eval_id:
+        eval_base = args.eval_root if args.eval_root else os.path.join(proj_root, 'eval')
+        out_dir = os.path.join(eval_base, args.eval_id)
+        os.makedirs(out_dir, exist_ok=True)
+    else:
+        out_dir = None
 
-        # GT projection is exp(-projs)
-        gt_proj = torch.exp(-projs)
+    # single no_grad context for the entire projection loop
+    with torch.no_grad():
+        for i in range(n_views):
+            rays = val_ds.rays[i].to(device)   # [H, W, 8]
+            projs = val_ds.projs[i].to(device) # [H, W]
 
-        p_psnr = get_psnr(pred_img, gt_proj)
-        p_ssim = get_ssim(pred_img, gt_proj)
+            pred_img = render_image(rays, sdf_model, att_model1, s_tensor,
+                                    args.n_samples, chunk_size=args.chunk_size,
+                                    tau=None, att_model2=att_model2)
 
-        proj_psnrs.append(float(p_psnr.item()))
-        proj_ssims.append(float(p_ssim))
+            # GT projection is exp(-projs)
+            gt_proj = torch.exp(-projs)
 
-        print(f"View {i+1:02d}/{n_views:02d}  --  Proj PSNR: {proj_psnrs[-1]:.4f}, Proj SSIM: {proj_ssims[-1]:.4f}")
+            # Save per-view projection image
+            if out_dir is not None:
+                fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+                axes[0].imshow(pred_img.cpu().numpy().T, cmap='gray')
+                axes[0].set_title('Predicted')
+                axes[0].axis('off')
+                axes[1].imshow(gt_proj.cpu().numpy().T, cmap='gray')
+                axes[1].set_title('Ground Truth')
+                axes[1].axis('off')
+                fig.savefig(os.path.join(out_dir, f'val_{i}.png'),
+                            bbox_inches='tight', pad_inches=0)
+                plt.close(fig)
 
-    # 3D sampling
+            p_psnr = get_psnr(pred_img, gt_proj)
+            p_ssim = get_ssim(pred_img, gt_proj)
+
+            proj_psnrs.append(float(p_psnr.item()))
+            proj_ssims.append(float(p_ssim))
+
+            print(f"View {i+1:02d}/{n_views:02d}  --  Proj PSNR: {proj_psnrs[-1]:.4f}, Proj SSIM: {proj_ssims[-1]:.4f}")
+
+    # 3D sampling — free the projection buffers first, then use the user's chunk_size
+    if device.startswith('cuda'):
+        torch.cuda.empty_cache()
     print("Sampling full 3D volume from model (this may take a while)...")
-    pred_volume = sample_3d_volume_from_models(sdf_model, att_model1, att_model2, s_param, val_ds.voxels, num_materials, chunk_size=8192, device=device)
+    pred_volume = sample_3d_volume_from_models(sdf_model, att_model1, att_model2, s_param, val_ds.voxels, num_materials, chunk_size=args.chunk_size, device=device)
     gt_volume = val_ds.image.cpu().numpy()
 
     print(f"Before normalization — pred range: [{pred_volume.min():.6f}, {pred_volume.max():.6f}], "
@@ -240,6 +274,25 @@ def main():
             writer.writeheader()
             writer.writerows(rows)
         print(f"Per-view metrics + summary written to: {args.save_csv}")
+
+    if out_dir is not None:
+        show_slice = 5
+        if pred_volume.ndim == 3:
+            show_step = max(1, pred_volume.shape[-1] // show_slice)
+            show = []
+            for i_show in range(show_slice):
+                idx = i_show * show_step
+                gt_slice = gt_volume[..., idx]
+                pred_slice = pred_volume[..., idx]
+                show.append(np.concatenate([gt_slice, pred_slice], axis=0))
+            show_density = np.concatenate(show, axis=1)
+            plt.figure(figsize=(10, 5))
+            plt.imshow(show_density, cmap='gray')
+            plt.axis('off')
+            plt.savefig(os.path.join(out_dir, 'volume_slices.png'),
+                        bbox_inches='tight', pad_inches=0)
+            plt.close()
+        print(f"Saved evaluation images to {out_dir}")
 
 
 if __name__ == '__main__':
