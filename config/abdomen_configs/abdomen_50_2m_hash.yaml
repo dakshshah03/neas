@@ -37,6 +37,6 @@ train:
 log:
   i_eval: 50
   i_save: 50
-  use_wandb: False
+  use_wandb: True
   wandb_project: neas
   wandb_entity: null

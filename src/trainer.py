@@ -41,7 +41,7 @@ class Trainer:
         self.tau_start = cfg["train"].get("tau_start", 2.0)
         self.warmup_iters = cfg["train"].get("warmup_iters", 500)
         
-        self.use_wandb = cfg["log"].get("use_wandb", False)
+        self.use_wandb = cfg["log"].get("use_wandb", True)
         self.wandb_project = cfg["log"].get("wandb_project", "neas")
         self.wandb_entity = cfg["log"].get("wandb_entity", None)
   
@@ -396,9 +396,10 @@ class Trainer:
                 
         # Concatenate all chunks and reshape to 3D volume
         pred_attenuation = torch.cat(pred_attenuation, dim=0)
-        pred_volume = pred_attenuation.reshape(n1, n2, n3).numpy()
+        pred_volume = pred_attenuation.reshape(n1, n2, n3)
+        gt_volume = torch.tensor(gt_volume, dtype=torch.float32) if not torch.is_tensor(gt_volume) else gt_volume
         
-        print(f"Volume sampled: shape={pred_volume.shape}, "
+        print(f"Volume sampled: shape={tuple(pred_volume.shape)}, "
               f"pred range=[{pred_volume.min():.6f}, {pred_volume.max():.6f}], "
               f"gt range=[{gt_volume.min():.6f}, {gt_volume.max():.6f}]")
         
@@ -439,36 +440,56 @@ class Trainer:
             plt.savefig(os.path.join(val_save_dir, f'val_{select_ind}.png'))
             plt.close()
             
-            proj_mse = get_mse(img, torch.exp(-projs)).item()
-            proj_psnr = get_psnr(img, torch.exp(-projs)).item()
-            proj_ssim = get_ssim(img, torch.exp(-projs)).item()
+            projs_gt = torch.exp(-projs)
+            projs_pred = img
+
+            proj_mse = get_mse(projs_pred, projs_gt).item()
+            proj_psnr = get_psnr(projs_pred, projs_gt).item()
+            proj_ssim = get_ssim(projs_pred, projs_gt).item()
             
             # Sample a 3D volume from the SDF
-            pred_volume, gt_volume = self.sample_3d_volume(chunk_size=8192)
+            image_pred, image = self.sample_3d_volume(chunk_size=8192)
             
-            vol_psnr_3d = get_psnr_3d(pred_volume, gt_volume)
-            vol_ssim_3d = get_ssim_3d(pred_volume, gt_volume)
-            
-            self.writer.add_scalar("eval/proj_mse", proj_mse, global_step)
-            self.writer.add_scalar("eval/proj_psnr", proj_psnr, global_step)
-            self.writer.add_scalar("eval/proj_ssim", proj_ssim, global_step)
-            self.writer.add_scalar("eval/3d_psnr", vol_psnr_3d, global_step)
-            self.writer.add_scalar("eval/3d_ssim", vol_ssim_3d, global_step)
-            self.writer.add_image("eval/proj_pred", cast_to_image(img.cpu().numpy().T), global_step, dataformats="HWC")
-            
+            vol_psnr_3d = get_psnr_3d(image_pred, image)
+            vol_ssim_3d = get_ssim_3d(image_pred, image)
+
+            projs = projs_gt
+
+            loss = {
+                "proj_mse": proj_mse,
+                "proj_psnr": proj_psnr,
+                "psnr_3d": vol_psnr_3d,
+                "ssim_3d": vol_ssim_3d,
+            }
+
+            print(f"Eval metrics - Proj MSE: {proj_mse:.6f}, Proj PSNR: {proj_psnr:.2f}, "
+                  f"Proj SSIM: {proj_ssim:.4f}, 3D PSNR: {vol_psnr_3d:.2f}, 3D SSIM: {vol_ssim_3d:.4f}")
+
+            # Logging
+            show_slice = 5
+            show_step = image.shape[-1]//show_slice
+            show_image = image[...,::show_step]
+            show_image_pred = image_pred[...,::show_step]
+            show = []
+            for i_show in range(show_slice):
+                show.append(torch.concat([show_image[..., i_show], show_image_pred[..., i_show]], dim=0))
+            show_density = torch.concat(show, dim=1)
+            show_proj = torch.concat([projs, projs_pred], dim=1)
+
+            self.writer.add_image("eval/density (row1: gt, row2: pred)", cast_to_image(show_density), global_step, dataformats="HWC")
+            self.writer.add_image("eval/projection (left: gt, right: pred)", cast_to_image(show_proj), global_step, dataformats="HWC")
+
+            for ls in loss.keys():
+                self.writer.add_scalar(f"eval/{ls}", loss[ls], global_step)
             if self.use_wandb:
                 wandb.log({
-                    "eval/proj_mse": proj_mse,
-                    "eval/proj_psnr": proj_psnr,
-                    "eval/proj_ssim": proj_ssim,
-                    "eval/3d_psnr": vol_psnr_3d,
-                    "eval/3d_ssim": vol_ssim_3d,
-                    "eval/epoch": idx_epoch,
-                    "eval/proj_pred": wandb.Image(img.cpu().numpy().T, caption=f"Prediction - Epoch {idx_epoch}"),
-                    "eval/proj_gt": wandb.Image(torch.exp(-projs).cpu().numpy().T, caption=f"Ground Truth - Epoch {idx_epoch}")
-                }, step=global_step)
-                
-            print(f"Eval metrics - Proj MSE: {proj_mse:.6f}, Proj PSNR: {proj_psnr:.2f}, Proj SSIM: {proj_ssim:.4f}, 3D PSNR: {vol_psnr_3d:.2f}, 3D SSIM: {vol_ssim_3d:.4f}")
+                    "eval/proj_mse": loss["proj_mse"],
+                    "eval/proj_psnr": loss["proj_psnr"],
+                    "eval/psnr_3d": loss["psnr_3d"],
+                    "eval/ssim_3d": loss["ssim_3d"],
+                    "eval/density_comparison": wandb.Image(cast_to_image(show_density), caption="Top: GT, Bottom: Pred"),
+                    "eval/projection_comparison": wandb.Image(cast_to_image(show_proj), caption="Left: GT, Right: Pred")
+                }, step=self.global_step)
             
         self.sdf_model.train()
         self.att_model1.train()
