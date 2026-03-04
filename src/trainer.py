@@ -34,6 +34,8 @@ class Trainer:
         self.val_n_samples = cfg["train"]["val_n_samples"]
         self.val_chunk_size = cfg["train"]["val_chunk_size"]
         self.lambda_reg = cfg["train"]["lambda_reg"]
+        self.lambda_mask = cfg["train"].get("lambda_mask", 0.0)
+        self.n_mask_rays = cfg["train"].get("n_mask_rays", 0) if self.lambda_mask > 0 else 0
         self.device = device
         
         # Frequency regularization (coarse-to-fine)
@@ -42,7 +44,7 @@ class Trainer:
         self.warmup_iters = cfg["train"].get("warmup_iters", 500)
         
         self.use_wandb = cfg["log"].get("use_wandb", True)
-        self.wandb_project = cfg["log"].get("wandb_project", "neas")
+        self.wandb_project = cfg["log"].get("wandb_project", "neas_2")
         self.wandb_entity = cfg["log"].get("wandb_entity", None)
   
         # Log directory
@@ -55,7 +57,7 @@ class Trainer:
 
         # Dataset
         num_views = cfg["train"].get("num_views", None)
-        train_dset = TIGREDataset(cfg["exp"]["datadir"], cfg["train"]["n_rays"], "train", device, num_views=num_views)
+        train_dset = TIGREDataset(cfg["exp"]["datadir"], cfg["train"]["n_rays"], "train", device, num_views=num_views, n_mask_rays=self.n_mask_rays)
         self.eval_dset = TIGREDataset(cfg["exp"]["datadir"], cfg["train"]["n_rays"], "val", device) if self.i_eval > 0 else None
         self.train_dloader = torch.utils.data.DataLoader(train_dset, batch_size=cfg["train"]["n_batch"], shuffle=True)
         
@@ -303,21 +305,74 @@ class Trainer:
         # Total loss
         L_total = L_int + self.lambda_reg * L_reg
         
+        # Mask loss: penalize non-zero attenuation predictions in air regions.
+        L_mask = torch.tensor(0.0, device=self.device)
+        if self.lambda_mask > 0 and 'mask_rays' in batch_data:
+            current_epoch = global_step // len(self.train_dloader)
+            max_mask_epoch = int(self.epochs * 0.1)
+            if current_epoch < max_mask_epoch:
+                mask_rays = batch_data['mask_rays'].to(self.device)          # [B, n_mask, 8]
+                mask_gt = batch_data['mask_projs_intensity'].to(self.device) # [B, n_mask]
+
+                mask_ray_o = mask_rays[..., :3]
+                mask_ray_d = mask_rays[..., 3:6]
+                mask_near  = mask_rays[..., 6:7]
+                mask_far   = mask_rays[..., 7:8]
+
+                B_m, N_m, _ = mask_ray_o.shape
+
+                t_m = torch.linspace(0., 1., steps=self.n_samples, device=self.device)
+                z_m = mask_near * (1. - t_m) + mask_far * t_m
+                mids_m = .5 * (z_m[..., 1:] + z_m[..., :-1])
+                z_m = torch.cat([z_m[..., :1], mids_m], dim=-1) + \
+                      (torch.cat([mids_m, z_m[..., -1:]], dim=-1) -
+                       torch.cat([z_m[..., :1], mids_m], dim=-1)) * torch.rand(z_m.shape, device=self.device)
+
+                pts_m = mask_ray_o.unsqueeze(2) + mask_ray_d.unsqueeze(2) * z_m.unsqueeze(-1)
+                pts_m_flat = pts_m.reshape(-1, 3)
+
+                if self.num_materials == 1:
+                    sdf_m, feat_m = self.sdf_model(pts_m_flat, tau=tau)
+                    bv_m = surface_boundary_function(sdf_m, self.s)
+                    att_m = self.att_model1(feat_m).squeeze(-1) * bv_m
+                else:
+                    d1_m, d2_m, feat_m = self.sdf_model(pts_m_flat, tau=tau)
+                    bv1_m = surface_boundary_function(d1_m, self.s)
+                    bv2_m = surface_boundary_function(d2_m, self.s)
+                    mu1_m = self.att_model1(feat_m).squeeze(-1) * bv1_m
+                    mu2_m = self.att_model2(feat_m).squeeze(-1) * bv2_m
+                    att_m = selector_function(d2_m, mu1_m, mu2_m)
+
+                att_m = att_m.reshape(B_m, N_m, self.n_samples)
+                dists_m = z_m[..., 1:] - z_m[..., :-1]
+                dists_m = torch.cat([dists_m, torch.ones_like(dists_m[..., :1]) * 1e-10], dim=-1)
+                dists_m = dists_m * torch.norm(mask_ray_d, dim=-1, keepdim=True)
+
+                pred_mask = volume_render_intensity(att_m, dists_m)
+                L_mask = torch.nn.functional.mse_loss(pred_mask, mask_gt)
+                L_total = L_total + self.lambda_mask * L_mask
+            else:
+                pass
+        
         loss = {
             "loss": L_total,
             "loss_int": L_int,
-            "loss_reg": L_reg
+            "loss_reg": L_reg,
+            "loss_mask": L_mask,
         }
         
         # Log
         self.writer.add_scalar("train/loss", L_total.item(), global_step)
         self.writer.add_scalar("train/loss_int", L_int.item(), global_step)
         self.writer.add_scalar("train/loss_reg", L_reg.item(), global_step)
+        self.writer.add_scalar("train/loss_mask", L_mask.item(), global_step)
         
         if self.use_wandb:
             wandb.log({
                 "train/loss": L_total.item(),
                 "train/loss_int": L_int.item(),
+                "train/loss_reg": L_reg.item(),
+                "train/loss_mask": L_mask.item(),
                 "train/loss_reg": L_reg.item(),
                 "train/epoch": global_step / len(self.train_dloader)
             }, step=global_step)
@@ -501,7 +556,7 @@ class Trainer:
         for idx_epoch in range(self.epoch_start, self.epochs + 1):
             
             # Evaluate
-            if (idx_epoch % self.i_eval == 0 or idx_epoch == self.epochs) and self.i_eval > 0 and idx_epoch > 0:
+            if (idx_epoch % self.i_eval == 0 or idx_epoch == self.epochs) and self.i_eval > 0:
                 self.eval_step(global_step=self.global_step, idx_epoch=idx_epoch)
             
             # Save checkpoint

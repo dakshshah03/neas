@@ -57,7 +57,7 @@ class TIGREDataset(Dataset):
     TIGRE dataset.
     """
 
-    def __init__(self, path, n_rays=1024, type="train", device="cuda", num_views=None):
+    def __init__(self, path, n_rays=1024, type="train", device="cuda", num_views=None, n_mask_rays=0):
         super().__init__()
 
         with open(path, "rb") as handle:
@@ -66,6 +66,7 @@ class TIGREDataset(Dataset):
         self.geo = ConeGeometry(data)
         self.type = type
         self.n_rays = n_rays
+        self.n_mask_rays = n_mask_rays
         
         # normalize scene to fit within unit sphere based on neas paper spec
         # The scene should fit within a sphere of radius 1.0
@@ -174,6 +175,18 @@ class TIGREDataset(Dataset):
                 "projs_intensity": projs_intensity,
                 "rays": rays,
             }
+
+            # Mask rays: sample from zero-attenuation (air) pixels for the mask loss.
+            if self.n_mask_rays > 0:
+                coords_zero = self.coords[~projs_valid]
+                if coords_zero.shape[0] > 0:
+                    replace = coords_zero.shape[0] < self.n_mask_rays
+                    mask_inds = np.random.choice(
+                        coords_zero.shape[0], size=[self.n_mask_rays], replace=replace
+                    )
+                    mask_coords = coords_zero[mask_inds].long()
+                    out["mask_rays"] = self.rays[index, mask_coords[:, 0], mask_coords[:, 1]]
+                    out["mask_projs_intensity"] = self.projs_intensity[index, mask_coords[:, 0], mask_coords[:, 1]]
         elif self.type == "val":
             rays = self.rays[index]
             projs = self.projs[index]
