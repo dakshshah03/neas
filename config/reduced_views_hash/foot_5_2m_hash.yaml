@@ -38,5 +38,5 @@ log:
   i_eval: 50
   i_save: 50
   use_wandb: true
-  wandb_project: neas
+  wandb_project: neas_experimental
   wandb_entity: null

@@ -44,7 +44,7 @@ class Trainer:
         self.warmup_iters = cfg["train"].get("warmup_iters", 500)
         
         self.use_wandb = cfg["log"].get("use_wandb", True)
-        self.wandb_project = cfg["log"].get("wandb_project", "neas_2")
+        self.wandb_project = cfg["log"].get("wandb_project", "neas_experimental")
         self.wandb_entity = cfg["log"].get("wandb_entity", None)
   
         # Log directory
@@ -324,7 +324,7 @@ class Trainer:
         L_mask = torch.tensor(0.0, device=self.device)
         if self.lambda_mask > 0 and 'mask_rays' in batch_data:
             current_epoch = global_step // len(self.train_dloader)
-            max_mask_epoch = int(self.epochs * 0.1)
+            max_mask_epoch = int(self.epochs * 0.2)
             if current_epoch < max_mask_epoch:
                 mask_rays = batch_data['mask_rays'].to(self.device)          # [B, n_mask, 8]
                 mask_gt = batch_data['mask_projs_intensity'].to(self.device) # [B, n_mask]
