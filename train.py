@@ -24,6 +24,7 @@ if __name__ == "__main__":
 
     # Load config
     cfg = load_config(args.config)
+    cfg["_config_path"] = args.config
 
     # Setup device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

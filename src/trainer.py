@@ -49,8 +49,8 @@ class Trainer:
   
         # Log directory
         self.expdir = osp.join(cfg["exp"]["expdir"], cfg["exp"]["expname"])
-        self.ckptdir = osp.join(self.expdir, "ckpt.tar")
-        self.ckptdir_backup = osp.join(self.expdir, "ckpt_backup.tar")
+        self.ckptdir = osp.join(self.expdir, "checkpoint.pth")
+        self.ckptdir_backup = osp.join(self.expdir, "checkpoint_backup.pth")
         self.evaldir = osp.join(self.expdir, "eval")
         os.makedirs(self.expdir, exist_ok=True)
         os.makedirs(self.evaldir, exist_ok=True)
@@ -164,6 +164,17 @@ class Trainer:
         self.writer = SummaryWriter(self.expdir)
         self.writer.add_text("parameters", self.args2string(cfg), global_step=0)
         
+        self.config_path = cfg.get("_config_path", None)
+        if self.config_path is not None and osp.exists(self.config_path):
+            try:
+                copyfile(self.config_path, osp.join(self.expdir, osp.basename(self.config_path)))
+            except Exception:
+                pass
+            try:
+                copyfile(self.config_path, osp.join(self.expdir, "config.yaml"))
+            except Exception:
+                pass
+
         if self.use_wandb:
             wandb.init(
                 project=self.wandb_project,
@@ -173,6 +184,10 @@ class Trainer:
                 dir=self.expdir
             )
             wandb.watch([self.sdf_model, self.att_model1], log="all", log_freq=100)
+            if self.config_path is not None and osp.exists(self.config_path):
+                config_art = wandb.Artifact("training-config", type="config")
+                config_art.add_file(self.config_path)
+                wandb.log_artifact(config_art)
         
         # Loss history
         self.loss_history = {'total': [], 'int': [], 'reg': []}
@@ -590,7 +605,22 @@ class Trainer:
                     checkpoint_dict['log2_hashmap_size'] = self.conf["network"].get("log2_hashmap_size", 19)
                 
                 torch.save(checkpoint_dict, save_path)
+                try:
+                    torch.save(checkpoint_dict, self.ckptdir)
+                except Exception:
+                    pass
                 print(f"Checkpoint saved at epoch {idx_epoch}")
+                try:
+                    torch.save(checkpoint_dict, self.ckptdir_backup)
+                except Exception:
+                    pass
+                if self.use_wandb:
+                    art_name = f"model_epoch_{idx_epoch}"
+                    model_art = wandb.Artifact(art_name, type="model")
+                    model_art.add_file(save_path)
+                    if self.config_path is not None and osp.exists(self.config_path):
+                        model_art.add_file(self.config_path)
+                    wandb.log_artifact(model_art)
             
             if idx_epoch == self.epochs:
                 break
