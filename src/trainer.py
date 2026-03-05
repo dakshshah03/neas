@@ -49,6 +49,7 @@ class Trainer:
         self.use_wandb = cfg["log"].get("use_wandb", True)
         self.wandb_project = cfg["log"].get("wandb_project", "neas_experimental")
         self.wandb_entity = cfg["log"].get("wandb_entity", None)
+        self.wandb_log_model = cfg["log"].get("wandb_log_model", False)
   
         # Log directory
         self.expdir = osp.join(cfg["exp"]["expdir"], cfg["exp"]["expname"])
@@ -590,7 +591,7 @@ class Trainer:
                     torch.save(checkpoint_dict, self.ckptdir_backup)
                 except Exception:
                     pass
-                if self.use_wandb:
+                if self.use_wandb and self.wandb_log_model:
                     art_name = f"model_epoch_{idx_epoch}"
                     model_art = wandb.Artifact(art_name, type="model")
                     model_art.add_file(save_path)
