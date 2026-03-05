@@ -110,44 +110,6 @@ class SDFMLPWrapper(nn.Module):
         return distances, features
 
 
-class SDFMLPWrapper2M(nn.Module):
-    """Wrapper for 2-material SDF MLP that returns TWO distances and features.
-    
-    Returns:
-        d1 [B]: Signed distance for material 1 (e.g., skin-air surface)
-        d2 [B]: Signed distance for material 2 (e.g., bone-muscle surface)
-        features [B, K]: Feature vector for attenuation networks
-    """
-    def __init__(self, encoder, mlp, feature_dim, encoding_type='freq', num_levels=None, level_dim=None):
-        super().__init__()
-        self.encoder = encoder
-        self.mlp = mlp
-        self.feature_dim = feature_dim
-        self.encoding_type = encoding_type
-        self.num_levels = num_levels
-        self.level_dim = level_dim
-    
-    def forward(self, x, tau=None):
-        if self.encoding_type == 'freq':
-            encoded = self.encoder(x, bound=tau)
-        elif self.encoding_type == 'hash':
-            encoded = self.encoder(x, size=1.0)
-            if tau is not None and self.num_levels is not None and self.level_dim is not None:
-                mask = _make_hash_coarsefine_mask(
-                    tau, self.num_levels, self.level_dim,
-                    encoded.device, encoded.dtype
-                )
-                encoded = encoded * mask
-        else:
-            encoded = self.encoder(x)
-
-        output = self.mlp(encoded)
-        d1 = output[:, 0]  # First SDF (skin-air)
-        d2 = output[:, 1]  # Second SDF (bone-muscle)
-        features = output[:, 2:2+self.feature_dim]
-        return d1, d2, features
-
-
 def sdf_freq_mlp(input_dim=3, output_dim=1, feature_dim=8, multires=6):
     """SDF MLP with frequency encoding - returns (distances [B], features [B, K])"""
     encoder = FreqEncoder(input_dim=input_dim, max_freq_log2=multires-1, N_freqs=multires, log_sampling=True, include_input=True)
@@ -191,55 +153,174 @@ def att_hash_mlp(input_dim=8, output_dim=1, num_levels=14, level_dim=2, base_res
     return nn.Sequential(mlp, activation)
 
 
-def sdf_freq_mlp_2m(input_dim=3, output_dim=2, feature_dim=8, multires=6):
-    """2-Material SDF MLP with frequency encoding.
-    
-    Returns (d1 [B], d2 [B], features [B, K]) where:
-    - d1: Signed distance for material 1 (e.g., skin-air surface)
-    - d2: Signed distance for material 2 (e.g., bone-muscle surface)
-    - features: Feature vector for attenuation networks
+class SDFMLPWrapperKM(nn.Module):
+    """Wrapper for K-material SDF MLP that returns K distances and features.
+
+    Handles an arbitrary number of materials K >= 2.
+
+    Returns:
+        distances: List of K tensors, each [B] — signed distance for material i
+        features: [B, feature_dim] — feature vector for attenuation network
     """
-    encoder = FreqEncoder(input_dim=input_dim, max_freq_log2=multires-1, N_freqs=multires, log_sampling=True, include_input=True)
-    mlp = MLPBlock(encoder.output_dim, 256, output_dim + feature_dim, 6)
-    return SDFMLPWrapper2M(encoder, mlp, feature_dim, encoding_type='freq')
+    def __init__(self, encoder, mlp, num_materials, feature_dim, encoding_type='freq', num_levels=None, level_dim=None):
+        super().__init__()
+        self.encoder = encoder
+        self.mlp = mlp
+        self.num_materials = num_materials
+        self.feature_dim = feature_dim
+        self.encoding_type = encoding_type
+        self.num_levels = num_levels
+        self.level_dim = level_dim
+
+    def forward(self, x, tau=None):
+        if self.encoding_type == 'freq':
+            encoded = self.encoder(x, bound=tau)
+        elif self.encoding_type == 'hash':
+            encoded = self.encoder(x, size=1.0)
+            if tau is not None and self.num_levels is not None and self.level_dim is not None:
+                mask = _make_hash_coarsefine_mask(
+                    tau, self.num_levels, self.level_dim,
+                    encoded.device, encoded.dtype
+                )
+                encoded = encoded * mask
+        else:
+            encoded = self.encoder(x)
+
+        output = self.mlp(encoded)
+        K = self.num_materials
+        distances = [output[:, i] for i in range(K)]
+        features = output[:, K:K+self.feature_dim]
+        return distances, features
 
 
-def sdf_hash_mlp_2m(input_dim=3, output_dim=2, feature_dim=8, num_levels=14, level_dim=2, base_resolution=16, log2_hashmap_size=19):
-    """2-Material SDF MLP with hash encoding.
-    
-    Returns (d1 [B], d2 [B], features [B, K]) where:
-    - d1: Signed distance for material 1 (e.g., skin-air surface)
-    - d2: Signed distance for material 2 (e.g., bone-muscle surface)  
-    - features: Feature vector for attenuation networks
-    
+class SharedAttenuationMLP(nn.Module):
+    """Shared attenuation backbone with K material output heads.
+
+    Merges independent attenuation MLPs into a single network with a shared
+    backbone and separate output heads per material.  Each head consists of a
+    single hidden layer responsible for predicting the raw attenuation μ̄_i.
+
+    Architecture:
+        features → [shared backbone] → shared_repr
+        shared_repr → head_1 → μ̄_1   (with CustomActivation)
+        shared_repr → head_2 → μ̄_2   (with CustomActivation)
+        ...
+        shared_repr → head_K → μ̄_K   (with CustomActivation)
+    """
+    def __init__(self, input_dim, hidden_dim, num_shared_layers, material_activations):
+        """
+        Args:
+            input_dim: Feature dimension from SDF network
+            hidden_dim: Hidden dimension for shared backbone and heads
+            num_shared_layers: Number of hidden layers in shared backbone
+            material_activations: List of (alpha, beta) tuples for each material
+        """
+        super().__init__()
+
+        # Shared backbone
+        layers = []
+        layers.append(nn.Linear(input_dim, hidden_dim))
+        layers.append(nn.ReLU(inplace=True))
+        for _ in range(num_shared_layers - 1):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.ReLU(inplace=True))
+        self.backbone = nn.Sequential(*layers)
+
+        # K output heads, each with 1 hidden layer + CustomActivation output
+        self.heads = nn.ModuleList()
+        for alpha, beta in material_activations:
+            head = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, 1),
+                CustomActivation(alpha, beta)
+            )
+            self.heads.append(head)
+
+    @property
+    def num_materials(self):
+        return len(self.heads)
+
+    def forward(self, features):
+        """Forward pass through shared backbone then per-material heads.
+
+        Args:
+            features: [B, input_dim] feature vectors from SDF network
+        Returns:
+            List of K tensors, each [B, 1], raw attenuation values per material
+        """
+        shared = self.backbone(features)
+        return [head(shared) for head in self.heads]
+
+
+def nested_material_selector(boundary_values, raw_attenuations):
+    """Nested K-material priority selector for soft material composition.
+
+    Computes:
+        μ(x) = Σ_i  μ̄_i · Ω(d_i, s) · Π_{j>i} (1 − Ω(d_j, s))
+
+    Materials are ordered from outermost (i=0, e.g. skin) to innermost
+    (i=K-1, e.g. bone).  Each material's contribution is weighted by its
+    own SBF value and the joint probability of NOT being inside any
+    deeper/denser material.  For the innermost material the product is 1.
+
+    Args:
+        boundary_values: List of K SBF tensors, each [B]
+        raw_attenuations: List of K raw attenuation tensors, each [B, 1]
+    Returns:
+        att_coeff: [B] total attenuation coefficient
+    """
+    K = len(boundary_values)
+    att_coeff = torch.zeros_like(boundary_values[0])
+    for i in range(K):
+        w_i = boundary_values[i]
+        for j in range(i + 1, K):
+            w_i = w_i * (1.0 - boundary_values[j])
+        att_coeff = att_coeff + raw_attenuations[i].squeeze(-1) * w_i
+    return att_coeff
+
+
+def sdf_freq_mlp_km(input_dim=3, num_materials=2, feature_dim=8, multires=6):
+    """K-Material SDF MLP with frequency encoding.
+
+    Returns (distances: list of K [B], features: [B, feature_dim]).
+    """
+    encoder = FreqEncoder(input_dim=input_dim, max_freq_log2=multires-1, N_freqs=multires,
+                          log_sampling=True, include_input=True)
+    mlp = MLPBlock(encoder.output_dim, 256, num_materials + feature_dim, 6)
+    return SDFMLPWrapperKM(encoder, mlp, num_materials, feature_dim, encoding_type='freq')
+
+
+def sdf_hash_mlp_km(input_dim=3, num_materials=2, feature_dim=8, num_levels=14, level_dim=2,
+                    base_resolution=16, log2_hashmap_size=19):
+    """K-Material SDF MLP with hash encoding.
+
+    Returns (distances: list of K [B], features: [B, feature_dim]).
     Uses smaller MLP (2 layers, 64 hidden) as per paper for hash encoding.
     """
-    encoder = HashEncoder(input_dim=input_dim, num_levels=num_levels, level_dim=level_dim, 
-                         base_resolution=base_resolution, log2_hashmap_size=log2_hashmap_size)
-    mlp = MLPBlock(encoder.output_dim, 64, output_dim + feature_dim, 2)
-    return SDFMLPWrapper2M(encoder, mlp, feature_dim, encoding_type='hash', num_levels=num_levels, level_dim=level_dim)
+    encoder = HashEncoder(input_dim=input_dim, num_levels=num_levels, level_dim=level_dim,
+                          base_resolution=base_resolution, log2_hashmap_size=log2_hashmap_size)
+    mlp = MLPBlock(encoder.output_dim, 64, num_materials + feature_dim, 2)
+    return SDFMLPWrapperKM(encoder, mlp, num_materials, feature_dim, encoding_type='hash',
+                           num_levels=num_levels, level_dim=level_dim)
 
 
-def selector_function(d2, mu1, mu2):
-    """Selector function Λ(d2, μ1, μ2) for choosing between two attenuation coefficients.
-    
-    As described in the paper:
-    - If d2 < 0 (point is inside material 2, e.g., bone): use μ2
-    - If d2 >= 0 (point is outside material 2): use μ1
-    
-    Args:
-        d2: Signed distance for material 2 [B, ...]
-        mu1: Attenuation coefficient for material 1 [B, ...]
-        mu2: Attenuation coefficient for material 2 [B, ...]
-    
-    Returns:
-        mu: Selected attenuation coefficient [B, ...]
+def shared_att_freq_mlp(input_dim=8, material_activations=None):
+    """Shared attenuation MLP for frequency encoding mode.
+
+    Backbone: 2 hidden layers (256).  Each head: 1 hidden layer (256) + output.
     """
-    # Use torch.where for differentiable selection
-    # d2 < 0 means inside material 2 (bone), use mu2
-    # d2 >= 0 means outside material 2 (muscle/soft tissue), use mu1
-    mu = torch.where(d2 < 0, mu2, mu1)
-    return mu
+    return SharedAttenuationMLP(input_dim, hidden_dim=256, num_shared_layers=2,
+                                material_activations=material_activations)
+
+
+def shared_att_hash_mlp(input_dim=8, material_activations=None):
+    """Shared attenuation MLP for hash encoding mode.
+
+    Backbone: 1 hidden layer (64).  Each head: 1 hidden layer (64) + output.
+    """
+    return SharedAttenuationMLP(input_dim, hidden_dim=64, num_shared_layers=1,
+                                material_activations=material_activations)
 
 
 def get_network(net_type, encoding_type='freq', num_materials=1):
@@ -248,7 +329,7 @@ def get_network(net_type, encoding_type='freq', num_materials=1):
     Args:
         net_type: 'sdf' or 'att'
         encoding_type: 'freq' or 'hash'
-        num_materials: 1 for 1M-NeAS, 2 for 2M-NeAS
+        num_materials: 1 for 1M-NeAS, >=2 for KM-NeAS
     """
     if net_type == 'sdf':
         if num_materials == 1:
@@ -256,15 +337,21 @@ def get_network(net_type, encoding_type='freq', num_materials=1):
                 return sdf_freq_mlp
             elif encoding_type == 'hash':
                 return sdf_hash_mlp
-        elif num_materials == 2:
+        else:  # K >= 2
             if encoding_type == 'freq':
-                return sdf_freq_mlp_2m
+                return sdf_freq_mlp_km
             elif encoding_type == 'hash':
-                return sdf_hash_mlp_2m
+                return sdf_hash_mlp_km
     elif net_type == 'att':
-        if encoding_type == 'freq':
-            return att_freq_mlp
-        elif encoding_type == 'hash':
-            return att_hash_mlp
+        if num_materials == 1:
+            if encoding_type == 'freq':
+                return att_freq_mlp
+            elif encoding_type == 'hash':
+                return att_hash_mlp
+        else:  # K >= 2
+            if encoding_type == 'freq':
+                return shared_att_freq_mlp
+            elif encoding_type == 'hash':
+                return shared_att_hash_mlp
     
     raise NotImplementedError(f"Unknown network type: {net_type} with encoding: {encoding_type} and num_materials: {num_materials}")

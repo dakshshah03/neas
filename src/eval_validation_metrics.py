@@ -31,8 +31,11 @@ if proj_root not in sys.path:
 from src.dataset.tigre import TIGREDataset
 from src.render.render import render_image, surface_boundary_function
 from src.network import (
-    sdf_freq_mlp, sdf_freq_mlp_2m, att_freq_mlp,
-    sdf_hash_mlp, sdf_hash_mlp_2m, att_hash_mlp, selector_function
+    sdf_freq_mlp, att_freq_mlp,
+    sdf_hash_mlp, att_hash_mlp,
+    sdf_freq_mlp_km, sdf_hash_mlp_km,
+    shared_att_freq_mlp, shared_att_hash_mlp,
+    SharedAttenuationMLP, nested_material_selector,
 )
 from src.utils.util import get_psnr, get_ssim, get_psnr_3d, get_ssim_3d
 
@@ -41,87 +44,73 @@ def _build_models_from_checkpoint(ckpt, device):
     feature_dim = ckpt.get('feature_dim', 8)
     encoding_type = ckpt.get('encoding_type', 'freq')
     num_materials = ckpt.get('num_materials', 1)
-
-    alpha1 = ckpt.get('alpha1', ckpt.get('alpha', 3.4))
-    beta1 = ckpt.get('beta1', ckpt.get('beta', 0.1))
-
     s_param = ckpt.get('s', 20.0)
 
-    if encoding_type == 'freq':
-        if num_materials == 1:
-            sdf_model = sdf_freq_mlp(input_dim=3, output_dim=1, feature_dim=feature_dim).to(device)
-        else:
-            sdf_model = sdf_freq_mlp_2m(input_dim=3, output_dim=2, feature_dim=feature_dim).to(device)
-        att_model1 = att_freq_mlp(input_dim=feature_dim, output_dim=1, alpha=alpha1, beta=beta1).to(device)
-        if num_materials == 2:
-            att_model2 = att_freq_mlp(input_dim=feature_dim, output_dim=1,
-                                      alpha=ckpt.get('alpha2', 5.5), beta=ckpt.get('beta2', 3.5)).to(device)
-        else:
-            att_model2 = None
-    else:  # hash
-        num_levels = ckpt.get('num_levels', 14)
-        level_dim = ckpt.get('level_dim', 2)
-        base_resolution = ckpt.get('base_resolution', 16)
-        log2_hashmap_size = ckpt.get('log2_hashmap_size', 19)
+    if num_materials >= 2:
+        # KM shared-latent-space architecture
+        material_configs = ckpt.get('material_configs', [(3.4, 0.1)] * num_materials)
 
-        if num_materials == 1:
+        if encoding_type == 'freq':
+            sdf_model = sdf_freq_mlp_km(input_dim=3, num_materials=num_materials,
+                                        feature_dim=feature_dim).to(device)
+            att_model = shared_att_freq_mlp(input_dim=feature_dim,
+                                            material_activations=material_configs).to(device)
+        else:
+            num_levels = ckpt.get('num_levels', 14)
+            level_dim = ckpt.get('level_dim', 2)
+            base_resolution = ckpt.get('base_resolution', 16)
+            log2_hashmap_size = ckpt.get('log2_hashmap_size', 19)
+            sdf_model = sdf_hash_mlp_km(input_dim=3, num_materials=num_materials,
+                                        feature_dim=feature_dim,
+                                        num_levels=num_levels, level_dim=level_dim,
+                                        base_resolution=base_resolution,
+                                        log2_hashmap_size=log2_hashmap_size).to(device)
+            att_model = shared_att_hash_mlp(input_dim=feature_dim,
+                                            material_activations=material_configs).to(device)
+
+        sdf_state = ckpt.get('sdf_model_state_dict', ckpt.get('sdf_state_dict'))
+        if sdf_state is not None:
+            sdf_model.load_state_dict(sdf_state)
+        att_model.load_state_dict(ckpt['att_model_shared_state_dict'])
+
+    else:  # K=1 — original 1M-NeAS architecture
+        material_configs = ckpt.get('material_configs', [(3.4, 0.1)])
+        alpha, beta = material_configs[0]
+
+        if encoding_type == 'freq':
+            sdf_model = sdf_freq_mlp(input_dim=3, output_dim=1, feature_dim=feature_dim).to(device)
+            att_model = att_freq_mlp(input_dim=feature_dim, output_dim=1, alpha=alpha, beta=beta).to(device)
+        else:
+            num_levels = ckpt.get('num_levels', 14)
+            level_dim = ckpt.get('level_dim', 2)
+            base_resolution = ckpt.get('base_resolution', 16)
+            log2_hashmap_size = ckpt.get('log2_hashmap_size', 19)
             sdf_model = sdf_hash_mlp(input_dim=3, output_dim=1, feature_dim=feature_dim,
                                      num_levels=num_levels, level_dim=level_dim,
-                                     base_resolution=base_resolution, log2_hashmap_size=log2_hashmap_size).to(device)
-        else:
-            sdf_model = sdf_hash_mlp_2m(input_dim=3, output_dim=2, feature_dim=feature_dim,
-                                        num_levels=num_levels, level_dim=level_dim,
-                                        base_resolution=base_resolution, log2_hashmap_size=log2_hashmap_size).to(device)
+                                     base_resolution=base_resolution,
+                                     log2_hashmap_size=log2_hashmap_size).to(device)
+            att_model = att_hash_mlp(input_dim=feature_dim, output_dim=1,
+                                     num_levels=num_levels, level_dim=level_dim,
+                                     base_resolution=base_resolution,
+                                     log2_hashmap_size=log2_hashmap_size,
+                                     alpha=alpha, beta=beta).to(device)
 
-        att_model1 = att_hash_mlp(input_dim=feature_dim, output_dim=1,
-                                  num_levels=num_levels, level_dim=level_dim,
-                                  base_resolution=base_resolution, log2_hashmap_size=log2_hashmap_size,
-                                  alpha=alpha1, beta=beta1).to(device)
-        if num_materials == 2:
-            att_model2 = att_hash_mlp(input_dim=feature_dim, output_dim=1,
-                                      num_levels=num_levels, level_dim=level_dim,
-                                      base_resolution=base_resolution, log2_hashmap_size=log2_hashmap_size,
-                                      alpha=ckpt.get('alpha2', 5.5), beta=ckpt.get('beta2', 3.5)).to(device)
-        else:
-            att_model2 = None
+        sdf_state = ckpt.get('sdf_model_state_dict', ckpt.get('sdf_state_dict'))
+        if sdf_state is not None:
+            sdf_model.load_state_dict(sdf_state)
+        att_state = ckpt.get('att_model1_state_dict', ckpt.get('att_model_state_dict'))
+        if att_state is not None:
+            att_model.load_state_dict(att_state)
 
-    sdf_state = None
-    if 'sdf_model_state_dict' in ckpt:
-        sdf_state = ckpt['sdf_model_state_dict']
-    elif 'sdf_state_dict' in ckpt:
-        sdf_state = ckpt['sdf_state_dict']
-
-    if sdf_state is not None:
-        sdf_model.load_state_dict(sdf_state)
-
-    att_state = None
-    if 'att_model1_state_dict' in ckpt:
-        att_state = ckpt['att_model1_state_dict']
-    elif 'att_model_state_dict' in ckpt:
-        att_state = ckpt['att_model_state_dict']
-
-    if att_state is not None:
-        att_model1.load_state_dict(att_state)
-
-    if num_materials == 2 and 'att_model2_state_dict' in ckpt:
-        if att_model2 is None:
-            if encoding_type == 'freq':
-                att_model2 = att_freq_mlp(input_dim=feature_dim, output_dim=1,
-                                          alpha=ckpt.get('alpha2', 5.5), beta=ckpt.get('beta2', 3.5)).to(device)
-            else:
-                att_model2 = att_hash_mlp(input_dim=feature_dim, output_dim=1,
-                                          num_levels=ckpt.get('num_levels', 14), level_dim=ckpt.get('level_dim', 2),
-                                          base_resolution=ckpt.get('base_resolution', 16), log2_hashmap_size=ckpt.get('log2_hashmap_size', 19),
-                                          alpha=ckpt.get('alpha2', 5.5), beta=ckpt.get('beta2', 3.5)).to(device)
-        att_model2.load_state_dict(ckpt['att_model2_state_dict'])
-
-    return sdf_model, att_model1, att_model2, float(s_param), int(num_materials)
+    return sdf_model, att_model, float(s_param), int(num_materials)
 
 
-def sample_3d_volume_from_models(sdf_model, att_model1, att_model2, s_param, voxels, num_materials, chunk_size=8192, device='cuda'):
+def sample_3d_volume_from_models(sdf_model, att_model, s_param, voxels, num_materials, chunk_size=8192, device='cuda'):
+    """Sample 3D attenuation volume. Uses 1M path for K=1, shared KM path for K>=2."""
     n1, n2, n3, _ = voxels.shape
     total = n1 * n2 * n3
     voxels_flat = voxels.reshape(-1, 3).to(device)
+    s_t = torch.tensor(s_param, device=device)
 
     pred_atten = []
     with torch.no_grad():
@@ -129,22 +118,17 @@ def sample_3d_volume_from_models(sdf_model, att_model1, att_model2, s_param, vox
             chunk = voxels_flat[i:i+chunk_size]
             if num_materials == 1:
                 sdf_d, feature = sdf_model(chunk, tau=None)
-                boundary = surface_boundary_function(sdf_d, torch.tensor(s_param, device=device))
-                att_vals = att_model1(feature)
-                att_coeff = att_vals.squeeze(-1) * boundary
+                boundary = surface_boundary_function(sdf_d, s_t)
+                att_coeff = att_model(feature).squeeze(-1) * boundary
             else:
-                d1, d2, feature = sdf_model(chunk, tau=None)
-                b1 = surface_boundary_function(d1, torch.tensor(s_param, device=device))
-                b2 = surface_boundary_function(d2, torch.tensor(s_param, device=device))
-                mu1 = att_model1(feature).squeeze(-1) * b1
-                mu2 = att_model2(feature).squeeze(-1) * b2
-                att_coeff = selector_function(d2, mu1, mu2)
-
+                distances, feature = sdf_model(chunk, tau=None)
+                bv = [surface_boundary_function(d, s_t) for d in distances]
+                raw_att = att_model(feature)
+                att_coeff = nested_material_selector(bv, raw_att)
             pred_atten.append(att_coeff.cpu())
 
     pred_atten = torch.cat(pred_atten, dim=0)
-    pred_volume = pred_atten.reshape(n1, n2, n3).numpy()
-    return pred_volume
+    return pred_atten.reshape(n1, n2, n3).numpy()
 
 
 def normalize_volume(pred_volume, gt_volume):
@@ -184,10 +168,8 @@ def main():
     if ckpt.get('encoding_type', 'freq') == 'hash' and device == 'cpu':
         raise RuntimeError("Checkpoint uses hash encoding which requires CUDA; run with --device cuda or use a freq-encoded checkpoint.")
 
-    sdf_model, att_model1, att_model2, s_param, num_materials = _build_models_from_checkpoint(ckpt, device)
-    sdf_model.eval(); att_model1.eval();
-    if att_model2 is not None:
-        att_model2.eval()
+    sdf_model, att_model, s_param, num_materials = _build_models_from_checkpoint(ckpt, device)
+    sdf_model.eval(); att_model.eval()
 
     # Load validation data
     val_ds = TIGREDataset(args.val_pickle, n_rays=1024, type='val', device=device)
@@ -214,9 +196,9 @@ def main():
             rays = val_ds.rays[i].to(device)   # [H, W, 8]
             projs = val_ds.projs[i].to(device) # [H, W]
 
-            pred_img = render_image(rays, sdf_model, att_model1, s_tensor,
+            pred_img = render_image(rays, sdf_model, att_model, s_tensor,
                                     args.n_samples, chunk_size=args.chunk_size,
-                                    tau=None, att_model2=att_model2)
+                                    tau=None, num_materials=num_materials)
 
             # GT projection is exp(-projs)
             gt_proj = torch.exp(-projs)
@@ -246,7 +228,7 @@ def main():
     if device.startswith('cuda'):
         torch.cuda.empty_cache()
     print("Sampling full 3D volume from model (this may take a while)...")
-    pred_volume = sample_3d_volume_from_models(sdf_model, att_model1, att_model2, s_param, val_ds.voxels, num_materials, chunk_size=args.chunk_size, device=device)
+    pred_volume = sample_3d_volume_from_models(sdf_model, att_model, s_param, val_ds.voxels, num_materials, chunk_size=args.chunk_size, device=device)
     gt_volume = val_ds.image.cpu().numpy()
 
     print(f"Before normalization — pred range: [{pred_volume.min():.6f}, {pred_volume.max():.6f}], "

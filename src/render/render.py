@@ -34,29 +34,29 @@ def volume_render_intensity(att_coeff, dists):
     return I_hat
 
 
-def render_image(rays, sdf_model, att_model, s, n_samples, chunk_size=4096, tau=None, att_model2=None):
+def render_image(rays, sdf_model, att_model, s, n_samples, chunk_size=4096, tau=None, num_materials=1):
     """Render a full image from rays.
     
     Args:
         rays: Ray tensor [H, W, 8] containing origins, directions, near, far
-        sdf_model: SDF network (1M or 2M)
-        att_model: First attenuation network (or only network for 1M-NeAS)
+        sdf_model: SDF network (1M or KM)
+        att_model: Attenuation network (nn.Sequential for 1M, SharedAttenuationMLP for KM)
         s: Boundary sharpness parameter
         n_samples: Number of samples per ray
         chunk_size: Batch size for processing rays
         tau: Optional coarse-to-fine frequency parameter
-        att_model2: Optional second attenuation network for 2M-NeAS
+        num_materials: 1 for 1M-NeAS, >=2 for KM-NeAS
         
     Returns:
         Rendered intensity image [H, W]
     """
-    from ..network import selector_function
+    from ..network import nested_material_selector
     
     device = rays.device
     H, W, _ = rays.shape
     rays_flat = rays.reshape(-1, 8)
     
-    is_2m = att_model2 is not None
+    is_km = num_materials > 1
     
     pred_intensities = []
     
@@ -77,24 +77,12 @@ def render_image(rays, sdf_model, att_model, s, n_samples, chunk_size=4096, tau=
             sampled_points = ray_origins.unsqueeze(1) + ray_directions.unsqueeze(1) * z_vals.unsqueeze(-1)
             sampled_points_flat = sampled_points.reshape(-1, 3)
             
-            if is_2m:
-                # 2M-NeAS: dual SDFs and dual attenuation
-                d1, d2, feature_vector = sdf_model(sampled_points_flat, tau=tau)
-                
-                # Compute boundary values for both materials
-                boundary_values1 = surface_boundary_function(d1, s)
-                boundary_values2 = surface_boundary_function(d2, s)
-                
-                # Compute attenuation from both networks
-                attenuation_values1 = att_model(feature_vector)
-                attenuation_values2 = att_model2(feature_vector)
-                
-                # Apply boundary functions
-                mu1 = attenuation_values1.squeeze(-1) * boundary_values1
-                mu2 = attenuation_values2.squeeze(-1) * boundary_values2
-                
-                # Use selector function based on d2
-                att_coeff = selector_function(d2, mu1, mu2)
+            if is_km:
+                # KM-NeAS: K SDFs + shared attenuation + nested selector
+                distances, feature_vector = sdf_model(sampled_points_flat, tau=tau)
+                boundary_values = [surface_boundary_function(d, s) for d in distances]
+                raw_attenuations = att_model(feature_vector)
+                att_coeff = nested_material_selector(boundary_values, raw_attenuations)
             else:
                 # 1M-NeAS: single SDF and single attenuation
                 sdf_distances, feature_vector = sdf_model(sampled_points_flat, tau=tau)

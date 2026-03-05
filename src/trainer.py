@@ -10,7 +10,10 @@ import numpy as np
 import wandb
 
 from .dataset import TIGREDataset
-from .network import sdf_freq_mlp, att_freq_mlp, sdf_hash_mlp, att_hash_mlp, sdf_freq_mlp_2m, sdf_hash_mlp_2m, selector_function
+from .network import (sdf_freq_mlp, att_freq_mlp, sdf_hash_mlp, att_hash_mlp,
+                      sdf_freq_mlp_km, sdf_hash_mlp_km,
+                      shared_att_freq_mlp, shared_att_hash_mlp,
+                      nested_material_selector)
 from .render import render_image, surface_boundary_function, volume_render_intensity
 from .utils import get_psnr, get_mse, get_psnr_3d, get_ssim, get_ssim_3d, cast_to_image
 
@@ -68,30 +71,27 @@ class Trainer:
         feature_dim = cfg["network"].get("feature_dim", 8)
         multires = cfg["network"].get("multires", 6)
         encoding_type = cfg["network"].get("encoding_type", "freq")  # 'freq' or 'hash'
-        num_materials = cfg["network"].get("num_materials", 1)  # 1 for 1M-NeAS, 2 for 2M-NeAS
-        
-        # Activation function parameters for material 1
-        alpha1 = cfg["network"].get("alpha1", cfg["network"].get("alpha", 3.4))
-        beta1 = cfg["network"].get("beta1", cfg["network"].get("beta", 0.1))
-        
-        # Activation function parameters for material 2 (only for 2M-NeAS)
-        alpha2 = cfg["network"].get("alpha2", 5.5)
-        beta2 = cfg["network"].get("beta2", 3.5)
+        num_materials = cfg["network"].get("num_materials", 1)  # 1 for 1M-NeAS, >=2 for KM-NeAS
         
         self.num_materials = num_materials
         
-        # Create SDF network (single or dual output)
+        # Build per-material activation configs: list of (alpha, beta)
+        material_configs = [(m['alpha'], m['beta']) for m in cfg['network']['materials']]
+        self.material_configs = material_configs
+        
+        # Create networks
         if encoding_type == "freq":
             if num_materials == 1:
                 self.sdf_model = sdf_freq_mlp(input_dim=3, output_dim=1, feature_dim=feature_dim, multires=multires).to(device)
-            else:
-                self.sdf_model = sdf_freq_mlp_2m(input_dim=3, output_dim=2, feature_dim=feature_dim, multires=multires).to(device)
-            
-            self.att_model1 = att_freq_mlp(input_dim=feature_dim, output_dim=1, alpha=alpha1, beta=beta1).to(device)
-            if num_materials == 2:
-                self.att_model2 = att_freq_mlp(input_dim=feature_dim, output_dim=1, alpha=alpha2, beta=beta2).to(device)
-            else:
-                self.att_model2 = None
+                self.att_model1 = att_freq_mlp(input_dim=feature_dim, output_dim=1,
+                                              alpha=material_configs[0][0], beta=material_configs[0][1]).to(device)
+                self.att_model = None
+            else:  # K >= 2: shared latent space
+                self.sdf_model = sdf_freq_mlp_km(input_dim=3, num_materials=num_materials,
+                                                 feature_dim=feature_dim, multires=multires).to(device)
+                self.att_model = shared_att_freq_mlp(input_dim=feature_dim,
+                                                     material_activations=material_configs).to(device)
+                self.att_model1 = None
                 
         elif encoding_type == "hash":
             num_levels = cfg["network"].get("num_levels", 14)
@@ -103,23 +103,20 @@ class Trainer:
                 self.sdf_model = sdf_hash_mlp(input_dim=3, output_dim=1, feature_dim=feature_dim,
                                              num_levels=num_levels, level_dim=level_dim,
                                              base_resolution=base_resolution, log2_hashmap_size=log2_hashmap_size).to(device)
-            else:  # num_materials == 2
-                self.sdf_model = sdf_hash_mlp_2m(input_dim=3, output_dim=2, feature_dim=feature_dim,
-                                                num_levels=num_levels, level_dim=level_dim,
-                                                base_resolution=base_resolution, log2_hashmap_size=log2_hashmap_size).to(device)
-            
-            # Create attenuation network(s)
-            self.att_model1 = att_hash_mlp(input_dim=feature_dim, output_dim=1,
-                                          num_levels=num_levels, level_dim=level_dim,
-                                          base_resolution=base_resolution, log2_hashmap_size=log2_hashmap_size,
-                                          alpha=alpha1, beta=beta1).to(device)
-            if num_materials == 2:
-                self.att_model2 = att_hash_mlp(input_dim=feature_dim, output_dim=1,
+                self.att_model1 = att_hash_mlp(input_dim=feature_dim, output_dim=1,
                                               num_levels=num_levels, level_dim=level_dim,
                                               base_resolution=base_resolution, log2_hashmap_size=log2_hashmap_size,
-                                              alpha=alpha2, beta=beta2).to(device)
-            else:
-                self.att_model2 = None
+                                              alpha=material_configs[0][0], beta=material_configs[0][1]).to(device)
+                self.att_model = None
+            else:  # K >= 2: shared latent space
+                self.sdf_model = sdf_hash_mlp_km(input_dim=3, num_materials=num_materials,
+                                                 feature_dim=feature_dim,
+                                                 num_levels=num_levels, level_dim=level_dim,
+                                                 base_resolution=base_resolution,
+                                                 log2_hashmap_size=log2_hashmap_size).to(device)
+                self.att_model = shared_att_hash_mlp(input_dim=feature_dim,
+                                                     material_activations=material_configs).to(device)
+                self.att_model1 = None
         else:
             raise ValueError(f"Unknown encoding type: {encoding_type}")
         
@@ -129,10 +126,10 @@ class Trainer:
         s_param = cfg["network"].get("s_param", 20.0)
         self.s = torch.nn.Parameter(torch.tensor(s_param, device=device))
         
-        grad_vars = list(self.sdf_model.parameters()) + list(self.att_model1.parameters()) + [self.s]
-        
-        if self.num_materials == 2:
-            grad_vars += list(self.att_model2.parameters())
+        if self.num_materials == 1:
+            grad_vars = list(self.sdf_model.parameters()) + list(self.att_model1.parameters()) + [self.s]
+        else:
+            grad_vars = list(self.sdf_model.parameters()) + list(self.att_model.parameters()) + [self.s]
         
         
         self.optimizer = torch.optim.Adam(params=grad_vars, lr=cfg["train"]["lrate"])
@@ -152,12 +149,14 @@ class Trainer:
             self.global_step = self.epoch_start * len(self.train_dloader)
             self.sdf_model.load_state_dict(ckpt["sdf_model_state_dict"])
             
-            if "att_model1_state_dict" in ckpt:
-                self.att_model1.load_state_dict(ckpt["att_model1_state_dict"])
-                if self.num_materials == 2 and "att_model2_state_dict" in ckpt:
-                    self.att_model2.load_state_dict(ckpt["att_model2_state_dict"])
-            elif "att_model_state_dict" in ckpt:
-                self.att_model1.load_state_dict(ckpt["att_model_state_dict"])
+            if self.num_materials == 1:
+                if "att_model1_state_dict" in ckpt:
+                    self.att_model1.load_state_dict(ckpt["att_model1_state_dict"])
+                elif "att_model_state_dict" in ckpt:
+                    self.att_model1.load_state_dict(ckpt["att_model_state_dict"])
+            else:
+                if "att_model_shared_state_dict" in ckpt:
+                    self.att_model.load_state_dict(ckpt["att_model_shared_state_dict"])
             
             self.s.data = ckpt["s"]
 
@@ -183,7 +182,8 @@ class Trainer:
                 config=cfg,
                 dir=self.expdir
             )
-            wandb.watch([self.sdf_model, self.att_model1], log="all", log_freq=100)
+            watch_models = [self.sdf_model, self.att_model1 if self.att_model1 is not None else self.att_model]
+            wandb.watch(watch_models, log="all", log_freq=100)
             if self.config_path is not None and osp.exists(self.config_path):
                 config_art = wandb.Artifact("training-config", type="config")
                 config_art.add_file(self.config_path)
@@ -259,23 +259,17 @@ class Trainer:
             # Attenuation coefficient
             att_coeff = attenuation_values.squeeze(-1) * boundary_values
         else:
-            # 2M-NeAS: dual SDFs and dual attenuation networks
-            d1, d2, feature_vector = self.sdf_model(sampled_points_flat, tau=tau)
+            # KM-NeAS: K SDFs + shared attenuation backbone + nested selector
+            distances, feature_vector = self.sdf_model(sampled_points_flat, tau=tau)
             
-            # Compute boundary values for both materials
-            boundary_values1 = surface_boundary_function(d1, self.s)
-            boundary_values2 = surface_boundary_function(d2, self.s)
+            # Compute boundary values for all K materials
+            bv = [surface_boundary_function(d, self.s) for d in distances]
             
-            # Compute attenuation from both networks (both use same feature vector)
-            attenuation_values1 = self.att_model1(feature_vector)
-            attenuation_values2 = self.att_model2(feature_vector)
+            # Shared attenuation backbone → K raw attenuation heads
+            raw_attenuations = self.att_model(feature_vector)
             
-            # Apply boundary functions
-            mu1 = attenuation_values1.squeeze(-1) * boundary_values1
-            mu2 = attenuation_values2.squeeze(-1) * boundary_values2
-            
-            # Use selector function to choose between mu1 and mu2 based on d2
-            att_coeff = selector_function(d2, mu1, mu2)
+            # Nested K-material priority selector
+            att_coeff = nested_material_selector(bv, raw_attenuations)
         
         att_coeff = att_coeff.reshape(batch_size, n_rays, self.n_samples)
         
@@ -298,24 +292,19 @@ class Trainer:
             n_norm = torch.linalg.norm(n, dim=-1)
             L_reg = torch.mean((n_norm - 1.0)**2)
         else:
-            n1 = torch.autograd.grad(
-                outputs=d1.sum(),
-                inputs=sampled_points_flat,
-                create_graph=True,
-                retain_graph=True
-            )[0]
-            n1_norm = torch.linalg.norm(n1, dim=-1)
-            L_reg1 = torch.mean((n1_norm - 1.0)**2)
-            
-            n2 = torch.autograd.grad(
-                outputs=d2.sum(),
-                inputs=sampled_points_flat,
-                create_graph=True,
-            )[0]
-            n2_norm = torch.linalg.norm(n2, dim=-1)
-            L_reg2 = torch.mean((n2_norm - 1.0)**2)
-            
-            L_reg = (L_reg1 + L_reg2) / 2.0
+            # Eikonal regularization for K SDF fields
+            L_reg = torch.tensor(0.0, device=self.device)
+            K = len(distances)
+            for i in range(K):
+                n_i = torch.autograd.grad(
+                    outputs=distances[i].sum(),
+                    inputs=sampled_points_flat,
+                    create_graph=True,
+                    retain_graph=True
+                )[0]
+                n_i_norm = torch.linalg.norm(n_i, dim=-1)
+                L_reg = L_reg + torch.mean((n_i_norm - 1.0)**2)
+            L_reg = L_reg / K
         
         # Total loss
         L_total = L_int + self.lambda_reg * L_reg
@@ -351,12 +340,10 @@ class Trainer:
                     bv_m = surface_boundary_function(sdf_m, self.s)
                     att_m = self.att_model1(feat_m).squeeze(-1) * bv_m
                 else:
-                    d1_m, d2_m, feat_m = self.sdf_model(pts_m_flat, tau=tau)
-                    bv1_m = surface_boundary_function(d1_m, self.s)
-                    bv2_m = surface_boundary_function(d2_m, self.s)
-                    mu1_m = self.att_model1(feat_m).squeeze(-1) * bv1_m
-                    mu2_m = self.att_model2(feat_m).squeeze(-1) * bv2_m
-                    att_m = selector_function(d2_m, mu1_m, mu2_m)
+                    dists_m, feat_m = self.sdf_model(pts_m_flat, tau=tau)
+                    bv_m = [surface_boundary_function(d, self.s) for d in dists_m]
+                    raw_att_m = self.att_model(feat_m)
+                    att_m = nested_material_selector(bv_m, raw_att_m)
 
                 att_m = att_m.reshape(B_m, N_m, self.n_samples)
                 dists_m = z_m[..., 1:] - z_m[..., :-1]
@@ -434,23 +421,11 @@ class Trainer:
                     att_coeff = attenuation_values.squeeze(-1) * boundary_values
                     
                 else:
-                    # 2M-NeAS: dual SDFs and dual attenuation networks
-                    d1, d2, feature_vector = self.sdf_model(chunk_voxels, tau=None)
-                    
-                    # Compute boundary values for both materials
-                    boundary_values1 = surface_boundary_function(d1, self.s)
-                    boundary_values2 = surface_boundary_function(d2, self.s)
-                    
-                    # Compute attenuation from both networks
-                    attenuation_values1 = self.att_model1(feature_vector)
-                    attenuation_values2 = self.att_model2(feature_vector)
-                    
-                    # Apply boundary functions
-                    mu1 = attenuation_values1.squeeze(-1) * boundary_values1
-                    mu2 = attenuation_values2.squeeze(-1) * boundary_values2
-                    
-                    # Use selector function to choose between mu1 and mu2 based on d2
-                    att_coeff = selector_function(d2, mu1, mu2)
+                    # KM-NeAS: K SDFs + shared attenuation + nested selector
+                    distances, feature_vector = self.sdf_model(chunk_voxels, tau=None)
+                    bv = [surface_boundary_function(d, self.s) for d in distances]
+                    raw_attenuations = self.att_model(feature_vector)
+                    att_coeff = nested_material_selector(bv, raw_attenuations)
                 
                 pred_attenuation.append(att_coeff.cpu())
                 
@@ -477,9 +452,10 @@ class Trainer:
         torch.cuda.empty_cache()
         
         self.sdf_model.eval()
-        self.att_model1.eval()
-        if self.num_materials == 2:
-            self.att_model2.eval()
+        if self.num_materials == 1:
+            self.att_model1.eval()
+        else:
+            self.att_model.eval()
         
         val_save_dir = osp.join(self.expdir, f'val_epoch_{idx_epoch}')
         os.makedirs(val_save_dir, exist_ok=True)
@@ -489,9 +465,10 @@ class Trainer:
             rays = self.eval_dset.rays[select_ind].to(self.device)
             projs_gt = self.eval_dset.projs_intensity[select_ind].to(self.device)
             
-            img = render_image(rays, self.sdf_model, self.att_model1, self.s, 
+            att_for_render = self.att_model1 if self.num_materials == 1 else self.att_model
+            img = render_image(rays, self.sdf_model, att_for_render, self.s, 
                              self.val_n_samples, chunk_size=self.val_chunk_size, tau=None, 
-                             att_model2=self.att_model2 if self.num_materials == 2 else None)
+                             num_materials=self.num_materials)
 
             # Visualization
             plt.figure(figsize=(10, 5))
@@ -557,9 +534,10 @@ class Trainer:
                 }, step=self.global_step)
             
         self.sdf_model.train()
-        self.att_model1.train()
-        if self.num_materials == 2:
-            self.att_model2.train()
+        if self.num_materials == 1:
+            self.att_model1.train()
+        else:
+            self.att_model.train()
 
     def start(self):
         """Main training loop."""
@@ -581,7 +559,6 @@ class Trainer:
                     'epoch': idx_epoch,
                     'args': self.conf,
                     'sdf_model_state_dict': self.sdf_model.state_dict(),
-                    'att_model1_state_dict': self.att_model1.state_dict(),
                     's': self.s.data,
                     'optimizer_state_dict': self.optimizer.state_dict(),
                     'scheduler_state_dict': self.lr_scheduler.state_dict(),
@@ -589,14 +566,13 @@ class Trainer:
                     'feature_dim': self.conf["network"].get("feature_dim", 8),
                     'encoding_type': self.encoding_type,
                     'num_materials': self.num_materials,
-                    'alpha1': self.conf["network"].get("alpha1", self.conf["network"].get("alpha", 3.4)),
-                    'beta1': self.conf["network"].get("beta1", self.conf["network"].get("beta", 0.1)),
+                    'material_configs': self.material_configs,
                 }
                 
-                if self.num_materials == 2:
-                    checkpoint_dict['att_model2_state_dict'] = self.att_model2.state_dict()
-                    checkpoint_dict['alpha2'] = self.conf["network"].get("alpha2", 5.5)
-                    checkpoint_dict['beta2'] = self.conf["network"].get("beta2", 3.5)
+                if self.num_materials == 1:
+                    checkpoint_dict['att_model1_state_dict'] = self.att_model1.state_dict()
+                else:
+                    checkpoint_dict['att_model_shared_state_dict'] = self.att_model.state_dict()
                 
                 if self.encoding_type == 'hash':
                     checkpoint_dict['num_levels'] = self.conf["network"].get("num_levels", 14)
