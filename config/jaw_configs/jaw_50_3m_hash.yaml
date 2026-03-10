@@ -1,10 +1,10 @@
 exp:
-  expname: foot_50_2m_hash
+  expname: jaw_50_3m_hash
   expdir: ./checkpoints/
-  datadir: ./data/foot_50.pickle
+  datadir: ./data/jaw_50.pickle
 network:
   encoding_type: hash
-  num_materials: 2
+  num_materials: 3
   feature_dim: 8
   multires: 6
   s_param: 20.0
@@ -13,8 +13,9 @@ network:
   base_resolution: 16
   log2_hashmap_size: 19
   materials:
-  - {alpha: 0.0685, beta: 0.0}
-  - {alpha: 0.1819, beta: 0.0685}
+  - {alpha: 0.0171, beta: 0.0}
+  - {alpha: 0.0168, beta: 0.0171}
+  - {alpha: 0.0794, beta: 0.0339}
 train:
   epoch: 1000
   n_batch: 1

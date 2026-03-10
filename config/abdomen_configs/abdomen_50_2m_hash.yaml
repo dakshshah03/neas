@@ -13,10 +13,8 @@ network:
   base_resolution: 16
   log2_hashmap_size: 19
   materials:
-  - alpha: 0.37
-    beta: 0.15
-  - alpha: 0.59
-    beta: 0.41
+  - {alpha: 0.054, beta: 0.0}
+  - {alpha: 0.1366, beta: 0.054}
 train:
   epoch: 1000
   n_batch: 1
