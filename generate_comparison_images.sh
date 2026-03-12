@@ -39,7 +39,7 @@ done
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PY_CMD="python"
 ANATOMIES=(chest foot jaw abdomen)
-SIZES=(1m 2m 3m 4m)
+SIZES=(2m)
 VARIANT="hash"
 
 echo "============================================================"
