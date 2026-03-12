@@ -160,7 +160,7 @@ class TIGREDataset(Dataset):
 
     def __getitem__(self, index):
         if self.type == "train":
-            projs_valid = (self.projs[index] > 0).flatten()
+            projs_valid = (self.projs[index] >= 0).flatten() #changed this to >= from >
             coords_valid = self.coords[projs_valid]
             select_inds = np.random.choice(
                 coords_valid.shape[0], size=[self.n_rays], replace=False
