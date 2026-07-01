@@ -9,7 +9,7 @@ network:
   feature_dim: 8
   multires: 6
   s_param: 20.0
-  alpha: 10
+  alpha: 3.4
   beta: 0.1
   num_levels: 14
   level_dim: 2
@@ -29,7 +29,7 @@ train:
   lambda_reg: 0.01
   num_views: 50
   resume: False
-  use_freq_reg: True
+  use_freq_reg: False
   tau_start: 2.0
   warmup_iters: 500
 
