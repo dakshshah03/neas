@@ -35,8 +35,8 @@ train:
   n_mask_rays: 64
   disable_3d_metrics: true
 log:
-  i_eval: 100
-  i_save: 100
+  i_eval: 50
+  i_save: 200
   use_wandb: true
   wandb_project: neas_brain
   wandb_entity: null
